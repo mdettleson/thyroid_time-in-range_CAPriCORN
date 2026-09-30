@@ -1,0 +1,238 @@
+---
+title: "05 Identify CV Outcomes"
+author: "Rachel Baccile"
+---
+
+```{r, include=FALSE}
+packages <- c("duckdb", "lubridate", "tidyverse", "dplyr", "readr", "arrow", "fst", "DBI")
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+
+read_data <- function(file_path) {
+  if (grepl("\\.csv$", file_path)) {
+    return(read.csv(file_path))
+  } else if (grepl("\\.parquet$", file_path)) {
+    return(arrow::read_parquet(file_path))
+  } else if (grepl("\\.fst$", file_path)) {
+    return(fst::read.fst(file_path))
+  } else {
+    stop("Unsupported file format")
+  }
+}
+
+write_files_to_duckdb_optimized <- function(files, tables_location, file_type, con) {
+  for (file_name in names(files)) {
+    file_path <- paste0(tables_location, "/", file_name, file_type)
+    table_name <- files[[file_name]]
+    sql <- sprintf(
+      "CREATE TABLE %s AS SELECT * FROM parquet_scan('%s')",
+      table_name, file_path
+    )
+    dbExecute(con, sql)
+    print(paste("Connected to DuckDB and wrote table:", table_name, "from", file_path))
+  }
+}
+write_files_to_duckdb <- function(files, tables_location, file_type, con) {
+  for (file_name in names(files)) {
+    file_path <- paste0(tables_location, "/", file_name, file_type)
+    data <- as.data.frame(read_data(file_path))
+    table_name <- files[[file_name]]
+    duckdb::dbWriteTable(con, table_name, data)
+    print(paste("Connected to DuckDB and wrote table:", table_name, "from file:", file_name))
+    rm(data)
+  }
+}
+
+con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+tables_location <- 'Z:/CAPriCORN_raw_ds/parquet/'
+output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
+file_type <- '.parquet'
+
+```
+
+```{r }
+icd10_snomed_crosswalk <- read.csv(paste0(tables_location, "icd10_snomed_crosswalk.csv"))
+
+files <- list(
+  "condition" = "condition",
+  "diagnosis" = "diagnosis"
+)
+
+write_files_to_duckdb(files, tables_location, file_type, con)
+```
+
+```{r}
+mi_snomed_codes <- icd10_snomed_crosswalk %>% filter(condition=="Myocardial infarction")
+mi_snomed_codes <- mi_snomed_codes$snomed_concept_id
+mi_icd10_codes <- icd10_snomed_crosswalk %>% filter(condition=="Myocardial infarction")
+mi_icd10_codes <- mi_icd10_codes$icd10_target
+mi_codes <- c(mi_icd10_codes, mi_snomed_codes)
+
+afib_snomed_codes <- icd10_snomed_crosswalk %>% filter(condition=="Atrial fibrillation")
+afib_snomed_codes <- afib_snomed_codes$snomed_concept_id
+afib_icd10_codes <- icd10_snomed_crosswalk %>% filter(condition=="Atrial fibrillation")
+afib_icd10_codes <- afib_icd10_codes$icd10_target
+afib_codes <- c(afib_icd10_codes, afib_snomed_codes)
+
+hf_snomed_codes <- icd10_snomed_crosswalk %>% filter(condition=="Heart failure")
+hf_snomed_codes <- hf_snomed_codes$snomed_concept_id
+hf_icd10_codes <- icd10_snomed_crosswalk %>% filter(condition=="Heart failure")
+hf_icd10_codes <- hf_icd10_codes$icd10_target
+hf_codes <- c(hf_icd10_codes, hf_snomed_codes)
+
+stroke_snomed_codes <- icd10_snomed_crosswalk %>% filter(condition=="Stroke")
+stroke_snomed_codes <- stroke_snomed_codes$snomed_concept_id
+stroke_icd10_codes <- icd10_snomed_crosswalk %>% filter(condition=="Stroke")
+stroke_icd10_codes <- stroke_icd10_codes$icd10_target
+stroke_codes <- c(stroke_icd10_codes, stroke_snomed_codes)
+
+mi_sql <- paste0("'", mi_codes, "'", collapse = ", ")
+hf_sql <- paste0("'", hf_codes, "'", collapse = ", ")
+stroke_sql <- paste0("'", stroke_codes, "'", collapse = ", ")
+afib_sql <- paste0("'", afib_codes, "'", collapse = ", ")
+```
+#import conditions and demo, filter to eligible population
+```{r data read and review}
+cohort <- readRDS(paste0(output_folder, "cohort_labs_meds_summary.Rds"))
+duckdb::duckdb_register(con, "cohort", cohort)
+
+query_cond <- paste0("
+WITH filtered_conditions AS (
+    SELECT 
+        STUDY_ID,
+        REPORT_DATE,
+        ONSET_DATE,
+        CONDITION,
+        CONDITION_TYPE,
+        CASE 
+            WHEN CONDITION LIKE '410.%' OR CONDITION IN (", mi_sql, ") THEN 'MI'
+            WHEN CONDITION LIKE '428.%' OR CONDITION IN (", hf_sql, ") THEN 'HF'
+            WHEN CONDITION LIKE '422._1' OR CONDITION LIKE '433._1' OR CONDITION LIKE '434._1' 
+                 OR CONDITION LIKE '436.%' OR CONDITION IN (", stroke_sql, ") THEN 'STROKE'
+            WHEN CONDITION LIKE '427.3%' OR CONDITION IN (", afib_sql, ") THEN 'AFIB'
+            ELSE NULL 
+        END AS diagnosis_group
+    FROM condition
+    WHERE STUDY_ID IN (SELECT STUDY_ID FROM cohort)
+)
+SELECT * FROM filtered_conditions
+WHERE diagnosis_group IS NOT NULL
+")
+
+query_dx <- paste0("
+WITH filtered_dx AS (
+    SELECT 
+        STUDY_ID,
+        DX_DATE,
+        DX,
+        DX_TYPE,
+        CASE 
+            WHEN DX LIKE '410.%' OR DX IN (", mi_sql, ") THEN 'MI'
+            WHEN DX LIKE '428.%' OR DX IN (", hf_sql, ") THEN 'HF'
+            WHEN DX LIKE '422._1' OR DX LIKE '433._1' OR DX LIKE '434._1' 
+                 OR DX LIKE '436.%' OR DX IN (", stroke_sql, ") THEN 'STROKE'
+            WHEN DX LIKE '427.3%' OR DX IN (", afib_sql, ") THEN 'AFIB'
+            ELSE NULL
+        END AS diagnosis_group
+    FROM diagnosis
+    WHERE STUDY_ID IN (SELECT STUDY_ID FROM cohort)
+)
+SELECT * FROM filtered_dx
+WHERE diagnosis_group IS NOT NULL
+")
+
+condition <- dbGetQuery(con, query_cond)
+dx <- dbGetQuery(con, query_dx)
+
+```
+
+
+```{r}
+dx_first <- dx %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(DX_DATE) %>% distinct()
+
+condition$REPORT_DATE <- as.Date(
+  parse_date_time(condition$REPORT_DATE, orders = c("ymd", "mdy"))
+)
+condition$ONSET_DATE <- as.Date(condition$ONSET_DATE)
+condition$min_cond_date <- pmin(condition$ONSET_DATE, condition$REPORT_DATE, na.rm = TRUE)
+condition_first <- condition %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(min_cond_date) %>% distinct()
+
+dx_cond <- full_join(condition_first, dx_first)
+dx_cond$first_dx_date <- pmin(dx_cond$min_cond_date, dx_cond$DX_DATE, na.rm = TRUE)
+dx_cond$icd_code <- ifelse(is.na(dx_cond$DX), dx_cond$CONDITION, dx_cond$DX)
+dx_cond <- dx_cond %>% select(STUDY_ID, diagnosis_group, first_dx_date) %>% distinct() %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(first_dx_date) %>% distinct()
+dx_cond$STUDY_ID <- as.character(dx_cond$STUDY_ID)
+
+cohort_dx <- left_join(dx_cond, cohort, by=c("STUDY_ID" = "cap_id") )
+cohort_dx$dx_date_first <- cohort_dx$first_dx_date - cohort_dx$first_tsh_lab
+cohort_dx$dx_date_last <- cohort_dx$first_dx_date - cohort_dx$last_tsh_lab
+cohort_dx <- cohort_dx %>% filter(dx_date_first>0 & dx_date_last<=365) %>% distinct()
+cohort_dx <- cohort_dx %>% select(STUDY_ID, first_dx_date, diagnosis_group) %>% distinct()
+
+cohort_dx_wide <- pivot_wider(cohort_dx, names_from = diagnosis_group, values_from = first_dx_date, names_glue = "{diagnosis_group}_dx_date") %>% distinct()
+
+outcomes <- left_join(cohort, cohort_dx_wide, by=c("cap_id" = "STUDY_ID"))
+
+outcomes$afib <- ifelse(!is.na(outcomes$AFIB_dx_date), 1, 0)
+outcomes$stroke <- ifelse(!is.na(outcomes$STROKE_dx_date), 1, 0)
+outcomes$hf <- ifelse(!is.na(outcomes$HF_dx_date), 1, 0)
+outcomes$mi <- ifelse(!is.na(outcomes$MI_dx_date), 1, 0)
+
+outcomes$cv_event <- ifelse(outcomes$afib==1 | outcomes$stroke==1 | outcomes$hf==1 | outcomes$mi==1, 1, 0)
+outcomes$cv_event_count <- outcomes$afib + outcomes$stroke + outcomes$hf + outcomes$mi
+
+df_1 <- readRDS(paste0(output_folder, "dataset_1_cohort.Rds"))
+df_1$cap_id <- as.character(df_1$cap_id)
+outcomes <- left_join(outcomes, df_1)
+
+outcomes <- outcomes %>% mutate(race_cat = case_when(race=="1" | race== "01" ~ "Other",
+                                              race=="2" | race== "02" ~ "Asian",
+                                              race=="3" | race== "03" ~ "Black or African American",
+                                              race=="4" | race== "04" ~ "Other",
+                                              race=="5" | race== "05" ~ "White",
+                                              race=="6" | race== "06" ~ "Other",
+                                              race=="7" | race== "07" ~ "Unknown",
+                                              race=="NI" ~ "Unknown",
+                                              race=="UN" ~ "Unknown",
+                                              race=="OT" ~ "Other"))
+
+outcomes <- outcomes %>% mutate(hispanic = case_when(ethnicity=="N" ~ "Not Hispanic",
+                                              ethnicity=="Y" ~ "Hispanic",
+                                               ethnicity=="R" ~ "Unknown",
+                                             ethnicity=="NULL" ~ "Unknown",
+                                              ethnicity=="NI" ~ "Unknown",
+                                              ethnicity=="UN" ~ "Unknown",
+                                              ethnicity=="OT" ~ "Unknown"))
+
+outcomes_first  <- outcomes  %>% 
+    group_by(cap_id) %>% 
+    arrange(first_tsh_lab) %>% 
+    filter(row_number() == 1)
+outcomes_first <- outcomes_first %>% filter(sex=='M' | sex=='F')
+
+saveRDS(outcomes_first, paste0(output_folder, "cohort_outcomes.Rds"))
+```
+
+
+```{r}
+
+all_variables_in_table1_rows <- c("episode_span_days", "n_tsh_labs", "afib", "stroke", "mi", "hf", "cv_event", "cv_event_count", "hypo_dx",
+                                  "age_enc", "sex", "race_cat", "hispanic")
+categorical_vars <- c("afib", "stroke", "mi", "hf", "cv_event", "cv_event_count", "hypo_dx",
+                                  "sex", "race_cat", "hispanic")
+nonnormal <- c("episode_span_days", "n_tsh_labs", "age_enc")
+table_2 <- tableone::CreateTableOne(vars = all_variables_in_table1_rows, strata="cv_event",
+                                    data = outcomes_first,
+                                    factorVars = categorical_vars,
+                                    addOverall = TRUE)
+table_2 <- as.data.frame(print(table_2, showAllLevels = TRUE, explain = FALSE, pDigits = 3, smd=F, nonnormal=nonnormal,
+                               formatOptions = list(big.mark = ","))) 
+print(table_2)
+```
