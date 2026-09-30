@@ -59,7 +59,11 @@ episode_summary <- df_episodes %>%
 
 analytic_df <- df_episodes %>%
   inner_join(episode_summary, by = c("cap_id", "episode"))%>%
-  mutate(episode_id = paste0(cap_id, "_", episode))
+  mutate(episode_id = paste0(cap_id, "_", episode)) %>% 
+  group_by(cap_id) %>% 
+  arrange(first_tsh_lab) %>% 
+  filter(row_number() == 1) %>% 
+  filter(sex=='M' | sex=='F')
 
 cohort_summary <- filtered_df %>%
   select(cap_id,
