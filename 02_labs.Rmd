@@ -1,0 +1,234 @@
+---
+title: "02 Identify all valid TSH Lab values"
+author: "Rachel Baccile"
+---
+
+```{r, include=FALSE}
+packages <- c("duckdb", "lubridate", "tidyverse", "dplyr", "readr", "arrow", "fst", "DBI")
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+
+read_data <- function(file_path) {
+  if (grepl("\\.csv$", file_path)) {
+    return(read.csv(file_path))
+  } else if (grepl("\\.parquet$", file_path)) {
+    return(arrow::read_parquet(file_path))
+  } else if (grepl("\\.fst$", file_path)) {
+    return(fst::read.fst(file_path))
+  } else {
+    stop("Unsupported file format")
+  }
+}
+
+write_files_to_duckdb_optimized <- function(files, tables_location, file_type, con) {
+  for (file_name in names(files)) {
+    file_path <- paste0(tables_location, "/", file_name, file_type)
+    table_name <- files[[file_name]]
+    sql <- sprintf(
+      "CREATE TABLE %s AS SELECT * FROM parquet_scan('%s')",
+      table_name, file_path
+    )
+    dbExecute(con, sql)
+    print(paste("Connected to DuckDB and wrote table:", table_name, "from", file_path))
+  }
+}
+write_files_to_duckdb <- function(files, tables_location, file_type, con) {
+  for (file_name in names(files)) {
+    file_path <- paste0(tables_location, "/", file_name, file_type)
+    data <- as.data.frame(read_data(file_path))
+    table_name <- files[[file_name]]
+    duckdb::dbWriteTable(con, table_name, data)
+    print(paste("Connected to DuckDB and wrote table:", table_name, "from file:", file_name))
+    rm(data)
+  }
+}
+
+con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+tables_location <- 'Z:/CAPriCORN_raw_ds/CAPriCORN'
+output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
+file_type <- '.csv'
+
+```
+
+```{r }
+files <- list(
+  "Lab" = "lab",
+  "Encounter" = "enc"
+)
+
+write_files_to_duckdb(files, tables_location, file_type, con)
+```
+
+#import all labs, filter to TSH
+```{r}
+df_1 <- readRDS(paste0(output_folder, "dataset_1_eligible_patients.Rds"))
+duckdb::duckdb_register(con, "df_1_view", df_1)
+
+# List of LOINC codes to filter
+code_list <- c("110665-7", "3015-5", "20452-9", "55462-6", "26998-5", "29575-8", "29574-1", "69561-9", "3016-3", "3016-3", "14297-6", "11580-8", "11579-0", "24348-5")
+
+# Build SQL IN clause
+codes_sql <- paste(sprintf("'%s'", code_list), collapse = ", ")
+
+# Get filtered and selected from cond
+tsh_daily <- dbGetQuery(
+  con,
+  sprintf(
+    "
+    WITH tsh_base AS (
+      SELECT
+        l.STUDY_ID,
+        l.ENCOUNTERID,
+        l.LAB_LOINC,
+        CAST(l.RESULT_DATE AS DATE) AS lab_date,
+        TRY_CAST(l.RESULT_NUM AS DOUBLE) AS RESULT_NUM,
+        e.ENC_TYPE
+      FROM lab l
+      INNER JOIN df_1_view d
+        ON l.STUDY_ID = d.cap_id
+      INNER JOIN enc e
+        ON l.ENCOUNTERID = e.ENCOUNTERID
+      WHERE l.LAB_LOINC IN (%s)
+    ),
+    tsh_distinct AS (
+      SELECT DISTINCT
+        STUDY_ID,
+        lab_date,
+        RESULT_NUM,
+        ENCOUNTERID,
+        LAB_LOINC,
+        ENC_TYPE
+      FROM tsh_base
+      WHERE RESULT_NUM IS NOT NULL
+        AND RESULT_NUM <= 1000
+    )
+    SELECT
+      STUDY_ID AS cap_id,
+      MIN(LAB_LOINC) AS loinc,
+      'TSH' AS lab,
+      lab_date,
+      AVG(RESULT_NUM) AS lab_value,
+      COUNT(*) AS n_lab_values,
+      MIN(ENCOUNTERID) AS lab_enc_id,
+      MIN(ENC_TYPE) AS enc_type
+    FROM tsh_distinct
+    GROUP BY STUDY_ID, lab_date
+    ORDER BY cap_id, lab_date
+    ",
+    codes_sql
+  )
+)
+```
+
+# If multiple labs within 30 day period, take the average
+```{r}
+duckdb::duckdb_register(con, "tsh_daily_view", tsh_daily)
+
+tsh_summary <- dbGetQuery(
+  con,
+  "
+  WITH lab_periods AS (
+    SELECT
+      cap_id,
+      lab_date,
+      lab_value,
+      FLOOR(
+        DATE_DIFF(
+          'day',
+          MIN(lab_date) OVER (PARTITION BY cap_id),
+          lab_date
+        ) / 30
+      ) AS lab_30day_period
+    FROM tsh_daily_view
+  ),
+  averaged_labs AS (
+    SELECT
+      cap_id,
+      lab_30day_period,
+      MIN(lab_date) AS period_start_date,
+      MAX(lab_date) AS period_end_date,
+      AVG(lab_value) AS avg_lab_value
+    FROM lab_periods
+    GROUP BY cap_id, lab_30day_period
+  )
+  SELECT
+    cap_id,
+    MIN(period_start_date) AS first_lab_date,
+    MAX(period_end_date) AS last_lab_date,
+    DATE_DIFF('day', MIN(period_start_date), MAX(period_end_date)) AS time_range_days,
+    COUNT(*) AS n_unique_lab_values
+  FROM averaged_labs
+  GROUP BY cap_id
+  ORDER BY cap_id
+  "
+)
+
+```
+
+# Initial filter for total time observed
+```{r}
+tsh_summary <- tsh_summary %>% filter(time_range_days >730 & n_unique_lab_values>=3)
+tsh_daily <- left_join(tsh_summary, tsh_daily)
+```
+
+# Generate long dataset of potentially eligible unique TSH values
+```{r}
+duckdb::duckdb_unregister(con, "tsh_daily_view")
+duckdb::duckdb_register(con, "tsh_daily_view", tsh_daily)
+tsh_30day_summary <- dbGetQuery(
+  con,
+  "
+  WITH filtered_labs AS (
+    SELECT
+      cap_id,
+      lab_date,
+      lab_value
+    FROM tsh_daily_view
+    WHERE lab_value IS NOT NULL
+      AND lab_value <= 1000
+  ),
+  lab_periods AS (
+    SELECT
+      cap_id,
+      lab_date,
+      lab_value,
+      FLOOR(
+        DATE_DIFF(
+          'day',
+          MIN(lab_date) OVER (PARTITION BY cap_id),
+          lab_date
+        ) / 30
+      ) AS lab_30day_period
+    FROM filtered_labs
+  )
+  SELECT
+    cap_id,
+    lab_30day_period,
+    MIN(lab_date) AS min_lab_date,
+    MAX(lab_date) AS max_lab_date,
+    AVG(lab_value) AS unique_lab_value,
+    COUNT(*) AS n_labs_in_window
+  FROM lab_periods
+  GROUP BY cap_id, lab_30day_period
+  ORDER BY cap_id, min_lab_date
+  "
+)
+
+df_1 <- df_1[df_1$cap_id %in% tsh_30day_summary$cap_id,]
+write.csv(
+  tsh_daily,
+  paste0(output_folder, "dataset_2_labs.csv"),
+  row.names = FALSE)
+
+saveRDS(df_1, paste0(output_folder, "dataset_1_cohort.Rds"))
+saveRDS(tsh_daily, paste0(output_folder, "dataset_2_labs.Rds"))
+saveRDS(tsh_30day_summary, paste0(output_folder, "tsh_30day_summary.Rds"))
+saveRDS(tsh_summary, paste0(output_folder, "tsh_summary.Rds"))
+```

@@ -1,0 +1,267 @@
+---
+title: "01 Eligible Patient Diagnosis Identification"
+author: "Uriah Martin-Velez and Rachel Baccile"
+---
+## Imports and Constants
+
+```{r setup}
+library(readr)
+library(dplyr)
+library(stringr)
+library(lubridate)
+
+capricorn_dir <- "Z:/CAPriCORN_raw_ds/CAPriCORN" # Read Data
+output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'# Write Outputs
+```
+
+# Identify inclusion and exclusion codes
+```{r}
+icd10_snomed_crosswalk <- read.csv(paste0(table_location, "icd10_snomed_crosswalk.csv"))
+                                   
+snomed_codes <- icd10_snomed_crosswalk$snomed_concept_id
+
+valid_hypo_codes <- c(
+  "244.0", "244.1", "244.2", "244.3", "244.8", "244.9", "245.2",
+  "E03.2", "E03.3", "E03.4", "E03.5", "E03.8", "E03.9",
+  "E06.3", "E06.5", "E89.0"
+)
+hypo_snomed_codes <- icd10_snomed_crosswalk %>% filter(domain=="Hypothyroidism - inclusion")
+hypo_snomed_codes <- hypo_snomed_codes$snomed_concept_id
+valid_hypo_codes <- c(valid_hypo_codes, hypo_snomed_codes)
+
+exclusion_snomed_codes <- icd10_snomed_crosswalk %>% filter(domain=="Exclusion")
+exclusion_snomed_codes <- exclusion_snomed_codes$snomed_concept_id
+
+exclusion_icd10_codes <- icd10_snomed_crosswalk %>% filter(domain=="Exclusion")
+exclusion_icd10_codes <- exclusion_icd10_codes$icd10_target
+
+exclusion_icd9_codes <- c("193", "242.00", "242.01", "242.1", "242.11", "242.2", "242.21", "242.3", "242.31",
+                          "242.4", "242.41","242.8", "242.81", "242.9", "242.91")
+
+exclusion_codes <- c(exclusion_icd10_codes, exclusion_icd9_codes, exclusion_snomed_codes)
+
+```
+
+## Qualifying Hypothyroidism Codes from `Diagnosis.csv`
+
+```{r}
+hypo_diagnosis <- read_csv(
+  file.path(capricorn_dir, "diagnosis.csv"),
+  col_select = c(STUDY_ID, DX, DX_TYPE, DX_DATE),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    DX = str_to_upper(str_trim(DX)),
+    DX_DATE = as.Date(DX_DATE)
+  ) %>%
+  filter(
+    DX %in% valid_hypo_codes
+  ) %>%
+  transmute(
+    cap_id = as.character(STUDY_ID),
+    hypo_dx = DX,
+    hypo_dx_date = DX_DATE
+  )
+head(hypo_diagnosis)
+```
+
+## Qualifying Hypothyroidism Codes from `Condition.csv`
+
+```{r}
+hypo_condition <- read_csv(
+  file.path(capricorn_dir, "Condition.csv"),
+  col_select = c(STUDY_ID, CONDITION, CONDITION_TYPE, REPORT_DATE, ONSET_DATE),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    CONDITION = str_to_upper(str_trim(CONDITION)),
+  ) %>%
+  filter(
+    CONDITION  %in% valid_hypo_codes
+  ) %>%
+  transmute(
+    cap_id = as.character(STUDY_ID),
+    hypo_dx = CONDITION,
+    REPORT_DATE = REPORT_DATE,
+    ONSET_DATE = ONSET_DATE
+  )
+
+head(hypo_condition)
+```
+
+## Combine and Clean Sources
+
+```{r}
+library(lubridate)
+
+hypo_condition$REPORT_DATE <- as.Date(
+  parse_date_time(hypo_condition$REPORT_DATE, orders = c("ymd", "mdy"))
+)
+hypo_condition$ONSET_DATE <- as.Date(hypo_condition$ONSET_DATE)
+hypo_condition$hypo_dx_date <- pmin(hypo_condition$ONSET_DATE, hypo_condition$REPORT_DATE, na.rm = TRUE)
+hypo_condition <- hypo_condition %>% select(cap_id, hypo_dx, hypo_dx_date) %>% distinct()
+
+hypothyroidism_patients <- bind_rows(
+  hypo_diagnosis,
+  hypo_condition
+) %>%
+  filter(
+    !is.na(cap_id),
+    !is.na(hypo_dx),
+    !is.na(hypo_dx_date),
+    hypo_dx!="428165003" # Exclude active pregnancy code
+  ) %>%
+  arrange(cap_id, hypo_dx_date) %>%
+  group_by(cap_id) %>%
+  slice(1) %>%
+  ungroup()
+
+head(hypothyroidism_patients)
+```
+
+## Exclusion Codes from `Diagnosis.csv`
+
+```{r}
+exclusion_diagnosis <- read_csv(
+  file.path(capricorn_dir, "diagnosis.csv"),
+  col_select = c(STUDY_ID, DX, DX_TYPE, DX_DATE),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    DX = str_to_upper(str_trim(DX)),
+    DX_DATE = as.Date(DX_DATE)
+  ) %>%
+  filter(
+    DX %in% exclusion_codes
+  ) %>%
+  transmute(
+    cap_id = as.character(STUDY_ID),
+    exclusion_dx = DX,
+    exclusion_dx_date = DX_DATE
+  )
+head(exclusion_diagnosis)
+```
+
+## Exclusion Codes from `Condition.csv`
+
+```{r}
+exclusion_condition <- read_csv(
+  file.path(capricorn_dir, "Condition.csv"),
+  col_select = c(STUDY_ID, CONDITION, CONDITION_TYPE, REPORT_DATE, ONSET_DATE),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    CONDITION = str_to_upper(str_trim(CONDITION)),
+  ) %>%
+  filter(
+    CONDITION  %in% exclusion_codes
+  ) %>%
+  transmute(
+    cap_id = as.character(STUDY_ID),
+    exclusion_dx = CONDITION,
+    REPORT_DATE = REPORT_DATE,
+    ONSET_DATE = ONSET_DATE
+  )
+
+head(exclusion_condition)
+```
+
+## Combine and Clean Sources
+
+```{r}
+exclusion_condition$REPORT_DATE <- as.Date(
+  parse_date_time(exclusion_condition$REPORT_DATE, orders = c("ymd", "mdy"))
+)
+exclusion_condition$ONSET_DATE <- as.Date(exclusion_condition$ONSET_DATE)
+exclusion_condition$exclusion_dx_date <- pmin(exclusion_condition$ONSET_DATE, exclusion_condition$REPORT_DATE, na.rm = TRUE)
+exclusion_condition <- exclusion_condition %>% select(cap_id, exclusion_dx, exclusion_dx_date) %>% distinct()
+
+exclusion_patients <- bind_rows(
+  exclusion_diagnosis,
+  exclusion_condition
+) %>%
+  filter(
+    !is.na(cap_id),
+    !is.na(exclusion_dx),
+    !is.na(exclusion_dx_date)
+  ) %>%
+  arrange(cap_id, exclusion_dx_date) %>%
+  group_by(cap_id) %>%
+  slice(1) %>%
+  ungroup()
+
+head(exclusion_patients)
+```
+
+## Final hypothyroid dx cohort, no exclusion dx
+
+```{r}
+`%not_in%` = Negate(`%in%`)
+hypothyroidism_patients <- hypothyroidism_patients[hypothyroidism_patients$cap_id %not_in% exclusion_patients$cap_id,]
+```
+
+```{r}
+demographics <- read_csv(
+  file.path(capricorn_dir, "demographics.csv"),
+  col_select = c(
+    STUDY_ID,
+    AGE_AT_FIRST_ENCOUNTER,
+    SEX,
+    HISPANIC,
+    RACE
+  ),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    cap_id = as.character(STUDY_ID),
+    age_enc = AGE_AT_FIRST_ENCOUNTER,
+    sex = SEX,
+    race = RACE,
+    ethnicity = HISPANIC
+  ) %>%
+  distinct(cap_id, .keep_all = TRUE)
+
+head(demographics)
+```
+
+## Eligible Patient Dataset
+
+```{r}
+dataset_1_eligible_patients <- hypothyroidism_patients %>%
+  inner_join(
+    demographics,
+    by = "cap_id"
+  ) %>%
+  filter(
+    !is.na(age_enc),
+    age_enc >= 18
+  ) %>%
+  select(
+    cap_id,
+    hypo_dx,
+    hypo_dx_date,
+    age_enc,
+    sex,
+    race,
+    ethnicity
+  ) %>%
+  arrange(cap_id)
+
+head(dataset_1_eligible_patients)
+```
+
+## Checks and Export
+
+```{r}
+dataset_1_eligible_patients %>%
+  summarise(
+    rows = n(),
+    unique_patients = n_distinct(cap_id),
+    missing_dx_date = sum(is.na(hypo_dx_date)),
+    missing_age = sum(is.na(age_enc))
+  )
+```
+
+```{r}
+saveRDS(dataset_1_eligible_patients, paste0(output_folder, "dataset_1_eligible_patients.Rds"))
+```

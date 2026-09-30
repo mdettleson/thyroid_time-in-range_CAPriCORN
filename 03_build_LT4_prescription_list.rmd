@@ -1,0 +1,527 @@
+---
+title: "02 Identify all valid LT4 Prescriptions"
+author: "Uriah Martin-Velez and Rachel Baccile"
+---
+# Set Up
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(readxl)
+library(janitor)
+
+capricorn_dir <- "Z:/CAPriCORN_raw_ds/CAPriCORN"  # Read Data
+output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
+
+eligible_patients_path <- file.path(
+  output_folder,
+  "dataset_1_eligible_patients.csv"
+)
+
+prescribing_path <- file.path(
+  capricorn_dir,
+  "Prescribing.csv"
+)
+
+dispensing_path <- file.path(
+  capricorn_dir,
+  "Dispensing.csv"
+)
+
+lt4_rxcui_path <- file.path(
+  capricorn_dir,
+  "LT4_RxCUI_short.xlsx"
+)
+
+lt4_ndc_path <- file.path(
+  capricorn_dir,
+  "LT4_NDC_short.xlsx"
+)
+
+output_path <- file.path(
+  output_folder,
+  "dataset_3_LT4_prescription_list.csv"
+)
+```
+
+### Helper Functions
+
+```{r helper-functions}
+normalize_id <- function(x) {
+  x <- as.character(x)
+  
+  x <- iconv(
+    x,
+    from = "",
+    to = "UTF-8",
+    sub = ""
+  )
+  
+  x <- stringr::str_trim(x)
+  x[x == ""] <- NA_character_
+  
+  x
+}
+
+normalize_rxcui <- function(x) {
+  x %>%
+    normalize_id() %>%
+    str_replace("\\.0+$", "")
+}
+
+normalize_ndc <- function(x) {
+  x %>%
+    normalize_id() %>%
+    str_replace_all("[^0-9]", "")
+}
+
+parse_mixed_date <- function(x) {
+  parsed_date <- suppressWarnings(
+    parse_date_time(
+      as.character(x),
+      orders = c(
+        "ymd HMS",
+        "ymd HM",
+        "ymd",
+        "mdy HMS",
+        "mdy HM",
+        "mdy",
+        "dmy HMS",
+        "dmy HM",
+        "dmy"
+      ),
+      tz = "UTC",
+      quiet = TRUE
+    )
+  )
+
+  as.Date(parsed_date)
+}
+```
+
+## Read Data
+
+```{r eligible-patients}
+eligible_patients <- readRDS(paste0(output_folder, 'dataset_1_cohort.Rds'))
+```
+
+Eligible patients: 549,729
+
+## Read LT4 RxCUI List
+
+```{r lt4-rxcui-list}
+lt4_rxcui_raw <- read_xlsx(
+  lt4_rxcui_path,
+  col_types = "text"
+) %>%
+  clean_names()
+
+lt4_rxcui <- lt4_rxcui_raw %>%
+  select(rxcui) %>%
+  unlist(use.names = FALSE) %>%
+  normalize_rxcui() %>%
+  discard(is.na) %>%
+  unique()
+
+cat(
+  "Unique LT4 RxCUI codes:",
+  length(lt4_rxcui),
+  "\n"
+)
+```
+
+Unique LT4 RxCUI codes: 715
+
+## Read LT4 NDC List
+
+```{r lt4-ndc-list}
+lt4_ndc_raw <- read_xlsx(
+  lt4_ndc_path,
+  col_types = "text"
+) %>%
+  clean_names()
+
+lt4_ndc <- lt4_ndc_raw %>%
+  transmute(
+    ndc = productndc %>%
+      str_remove("^\\*") %>%
+      str_replace_all("[^0-9]", "")
+  ) %>%
+  filter(!is.na(ndc), ndc != "") %>%
+  distinct() %>%
+  pull(ndc)
+
+cat(
+  "Unique LT4 product NDC codes:",
+  length(lt4_ndc),
+  "\n"
+)
+```
+
+Unique LT4 NDC codes: 566
+
+## Define LT4 Medication Names
+
+```{r lt4-name-pattern}
+lt4_name_pattern <- regex(
+  paste(
+    c(
+      "levothyroxine",
+      "synthroid",
+      "levoxyl",
+      "tirosint",
+      "unithroid",
+      "euthyrox",
+      "ermeza",
+      "thyquidity"
+    ),
+    collapse = "|"
+  ),
+  ignore_case = TRUE
+)
+```
+
+# Read and filter prescribing records
+
+```{r prescribing-records}
+prescribing_lt4 <- read_csv(
+  prescribing_path,
+  col_select = c(
+    STUDY_ID,
+    RXNORM_CUI,
+    RAW_RX_NDC,
+    RAW_RX_MED_NAME,
+    RX_ORDER_DATE,
+    RX_DOSE_ORDRED,
+    RX_DOSE_ORDRED_UNIT
+  ),
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    cap_id = normalize_id(STUDY_ID),
+
+    rxnorm_cui = normalize_rxcui(
+      RXNORM_CUI
+    ),
+
+    rxnorm_ndc = normalize_ndc(
+      RAW_RX_NDC
+    ),
+
+    rx_name = normalize_id(
+      RAW_RX_MED_NAME
+    ),
+
+    rx_date = parse_mixed_date(
+      RX_ORDER_DATE
+    ),
+
+    rx_dose = normalize_id(
+      RX_DOSE_ORDRED
+    ),
+
+    rx_dose_unit = normalize_id(
+      RX_DOSE_ORDRED_UNIT
+    ),
+
+    record_source = "prescribing"
+  ) %>%
+  semi_join(
+    eligible_patients,
+    by = "cap_id"
+  ) %>%
+  mutate(
+    matched_rxcui = (
+      !is.na(rxnorm_cui) &
+        rxnorm_cui %in% lt4_rxcui
+    ),
+
+    matched_ndc = (
+      !is.na(rxnorm_ndc) &
+        rxnorm_ndc %in% lt4_ndc
+    ),
+
+    matched_name = (
+      !is.na(rx_name) &
+        str_detect(rx_name, lt4_name_pattern)
+    )
+  ) %>%
+  filter(
+    matched_rxcui |
+      matched_ndc |
+      matched_name
+  )
+
+cat(
+  "LT4 prescribing records:",
+  nrow(prescribing_lt4),
+  "\n"
+)
+
+cat(
+  "Patients with an LT4 prescribing record:",
+  n_distinct(prescribing_lt4$cap_id),
+  "\n"
+)
+```
+
+LT4 prescribing records: 19,968,609
+
+Patients with an LT4 prescribing record: 329,094
+
+## Confirm
+
+```{r inspection}
+dispensing_column_names <- read_csv(
+  dispensing_path,
+  n_max = 5,
+  show_col_types = FALSE
+) %>%
+  names()
+
+dispensing_column_names
+```
+
+# Read and Filter Dispensing Records
+
+```{r dispensing-records}
+dispensing_lt4 <- read_csv(
+  dispensing_path,
+  col_select = c(
+    STUDY_ID,
+    DISPENSE_DATE,
+    NDC,
+    DISPENSE_DOSE_DISP,
+    DISPENSE_DOSE_DISP_UNIT
+  ),
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE
+) %>%
+  transmute(
+    cap_id = normalize_id(STUDY_ID),
+    rxnorm_cui = NA_character_,
+    rxnorm_ndc = normalize_ndc(NDC),
+    rx_name = NA_character_,
+    rx_date = parse_mixed_date(DISPENSE_DATE),
+    rx_dose = normalize_id(DISPENSE_DOSE_DISP),
+    rx_dose_unit = normalize_id(DISPENSE_DOSE_DISP_UNIT),
+    record_source = "dispensing"
+  ) %>%
+  semi_join(
+    eligible_patients,
+    by = "cap_id"
+  ) %>%
+    filter(str_starts(rxnorm_ndc, regex(paste0("^(", paste(lt4_ndc, collapse = "|"), ")"))))%>%
+mutate(
+    matched_rxcui = FALSE,
+    matched_name = FALSE
+  )
+
+cat(
+  "LT4 dispensing records:",
+  nrow(dispensing_lt4),
+  "\n"
+)
+
+cat(
+  "Patients with an LT4 dispensing record:",
+  n_distinct(dispensing_lt4$cap_id),
+  "\n"
+)
+```
+
+```{r combine-records}
+dataset_3_lt4 <- bind_rows(
+  prescribing_lt4,
+  dispensing_lt4
+) %>%
+  filter(
+    !is.na(cap_id),
+    !is.na(rx_date)
+  ) %>%
+  distinct(
+    cap_id,
+    rxnorm_cui,
+    rxnorm_ndc,
+    rx_name,
+    rx_date,
+    rx_dose,
+    rx_dose_unit,
+    record_source,
+    .keep_all = TRUE
+  ) %>%
+  arrange(
+    cap_id,
+    rx_date,
+    record_source
+  )
+
+cat(
+  "Final Dataset 3 rows:",
+  nrow(dataset_3_lt4),
+  "\n"
+)
+
+cat(
+  "Unique patients in Dataset 3:",
+  n_distinct(dataset_3_lt4$cap_id),
+  "\n"
+)
+```
+
+```{r}
+'%not_in%' <- Negate(`%in%`)
+combination_meds <- dataset_3_lt4 %>% filter(rx_name %like% "LEVOTHYROXINE-LIOTHYRONINE" |
+                                            rx_name %like% "liotrix")
+dataset_3_lt4 <- dataset_3_lt4[dataset_3_lt4$cap_id %not_in% combination_meds$cap_id,]
+
+tibble(
+  source = c("prescribing", "dispensing"),
+  rows = c(
+    nrow(prescribing_lt4),
+    nrow(dispensing_lt4)
+  ),
+  unique_patients = c(
+    n_distinct(prescribing_lt4$cap_id),
+    n_distinct(dispensing_lt4$cap_id)
+  )
+)
+```
+
+```{r qa-summary}
+eligible_patients_qa <- read_csv(
+  paste0(output_folder, "dataset_1_eligible_patients.csv"),
+  col_select = cap_id,
+  col_types = cols(cap_id = col_character()),
+  show_col_types = FALSE
+) %>%
+  mutate(
+    cap_id = normalize_id(cap_id)
+  ) %>%
+  filter(!is.na(cap_id)) %>%
+  distinct(cap_id)
+
+qa_summary <- tibble(
+  rows = nrow(dataset_3_lt4),
+  
+  unique_patients = n_distinct(
+    dataset_3_lt4$cap_id
+  ),
+  
+  eligible_patients = nrow(
+    eligible_patients_qa
+  ),
+  
+  eligible_without_lt4 = eligible_patients_qa %>%
+    anti_join(
+      dataset_3_lt4 %>% distinct(cap_id),
+      by = "cap_id"
+    ) %>%
+    nrow(),
+  
+  missing_rx_date = sum(
+    is.na(dataset_3_lt4$rx_date)
+  ),
+  
+  missing_rx_name = sum(
+    is.na(dataset_3_lt4$rx_name)
+  ),
+  
+  missing_rxcui = sum(
+    is.na(dataset_3_lt4$rxnorm_cui)
+  ),
+  
+  missing_ndc = sum(
+    is.na(dataset_3_lt4$rxnorm_ndc)
+  ),
+  
+  missing_dose = sum(
+    is.na(dataset_3_lt4$rx_dose)
+  )
+)
+
+qa_summary
+```
+
+```{r source-summary}
+source_summary <- dataset_3_lt4 %>%
+  group_by(record_source) %>%
+  summarise(
+    rows = n(),
+    unique_patients = n_distinct(cap_id),
+    .groups = "drop"
+  )
+
+source_summary
+```
+
+```{r match-method-summary}
+match_method_summary <- dataset_3_lt4 %>%
+  summarise(
+    matched_by_rxcui = sum(
+      matched_rxcui,
+      na.rm = TRUE
+    ),
+    
+    matched_by_ndc = sum(
+      matched_ndc,
+      na.rm = TRUE
+    ),
+    
+    matched_by_name = sum(
+      matched_name,
+      na.rm = TRUE
+    ),
+    
+    matched_only_by_name = sum(
+      matched_name &
+        !matched_rxcui &
+        !matched_ndc,
+      na.rm = TRUE
+    )
+  )
+
+match_method_summary
+```
+
+```{r duplicate-check}
+duplicate_check <- dataset_3_lt4 %>%
+  count(
+    cap_id,
+    rxnorm_cui,
+    rxnorm_ndc,
+    rx_name,
+    rx_date,
+    rx_dose,
+    rx_dose_unit,
+    record_source
+  ) %>%
+  filter(n > 1)
+
+cat(
+  "Remaining duplicate combinations:",
+  nrow(duplicate_check),
+  "\n"
+)
+
+duplicate_check
+```
+
+```{r export}
+saveRDS(
+  dataset_3_lt4,
+  output_path)
+
+cat(
+  "Dataset 3 saved to:",
+  output_path,
+  "\n"
+)
+```
+
+```{r preview-dataset-3}
+dataset_3_lt4 %>%
+  head(10) %>%
+  View()
+```

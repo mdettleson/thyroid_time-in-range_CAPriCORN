@@ -1,0 +1,85 @@
+---
+title: "04 Final Cohort Identification"
+author: "Rachel Baccile"
+---
+
+```{r setup}
+library(tidyverse)
+library(data.table)
+
+output_folder <- "/cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/"
+```
+
+
+# import potentially eligible cohort, LT4 prescriptions, and TSH values
+```{r}
+
+df_1 <- readRDS(paste0(output_folder, "dataset_1_cohort.Rds"))
+tsh_30day_sum <- readRDS(paste0(output_folder, "tsh_30day_summary.Rds"))
+
+meds <- readRDS(paste0(output_folder, "dataset_3_LT4_prescription_list.Rds"))
+df_1$cap_id <- as.character(df_1$cap_id)
+tsh_30day_sum$cap_id <- as.character(tsh_30day_sum$cap_id)
+
+```
+
+# Identify eligible episodes of TSH observation
+
+```{r}
+cohort_meds <- left_join(df_1, meds)
+cohort_meds <- cohort_meds %>% filter(!is.na(rx_date))
+cohort_meds <- cohort_meds %>% group_by(cap_id) %>% slice_min(rx_date) %>% select(cap_id, rx_date) %>% distinct()
+
+cohort_meds_labs <- left_join(cohort_meds, tsh_30day_sum)
+cohort_meds_labs$med_lab_datedif <- cohort_meds_labs$min_lab_date - cohort_meds_labs$rx_date
+cohort_meds_labs <- cohort_meds_labs %>% filter(med_lab_datedif>=183)
+
+df_episodes <- cohort_meds_labs %>%
+  mutate(min_lab_date = as.Date(min_lab_date)) %>%
+  arrange(cap_id, min_lab_date) %>%
+  group_by(cap_id) %>%
+  mutate(
+    gap_days = as.numeric(min_lab_date - lag(min_lab_date)),
+    new_episode = if_else(is.na(gap_days) | gap_days > 365.25 * 2, 1, 0),
+    episode = cumsum(new_episode)
+  ) %>%
+  ungroup()
+
+episode_summary <- df_episodes %>%
+  group_by(cap_id, episode) %>%
+  summarise(
+    n_labs = n(),
+    first_lab = min(min_lab_date, na.rm = TRUE),
+    last_lab = max(min_lab_date, na.rm = TRUE),
+    episode_span_days = as.numeric(last_lab - first_lab),
+    .groups = "drop")%>%
+  filter(
+    n_labs >= 3,
+    episode_span_days >= 730)
+
+analytic_df <- df_episodes %>%
+  inner_join(episode_summary, by = c("cap_id", "episode"))%>%
+  mutate(episode_id = paste0(cap_id, "_", episode))
+
+cohort_summary <- filtered_df %>%
+  select(cap_id,
+         episode,
+         episode_id,
+         first_rx_date = rx_date,
+         n_tsh_labs = n_labs,
+         first_tsh_lab = first_lab,
+         last_tsh_lab = last_lab,
+         episode_span_days) %>% distinct()
+
+  analytic_df <- analytic_df %>%
+  select(cap_id,
+         episode,
+         episode_id,
+         min_lab_date = tsh_date,
+         unique_lab_value = tsh_value)
+
+
+saveRDS(analytic_df, paste0(output_folder, "for_tir_calc.Rds"))
+saveRDS(cohort_summary, paste0(output_folder, "cohort_labs_meds_summary.Rds"))
+
+```
