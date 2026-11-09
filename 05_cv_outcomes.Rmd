@@ -41,17 +41,24 @@ write_files_to_duckdb_optimized <- function(files, tables_location, file_type, c
 }
 write_files_to_duckdb <- function(files, tables_location, file_type, con) {
   for (file_name in names(files)) {
-    file_path <- paste0(tables_location, "/", file_name, file_type)
+    file_path <- file.path(tables_location, 
+                           paste0(file_name, ".", file_type))
+    
+    # Verify file exists before trying to read
+    if (!file.exists(file_path)) {
+      stop(paste("File not found:", file_path))
+    }
+    
     data <- as.data.frame(read_data(file_path))
     table_name <- files[[file_name]]
     duckdb::dbWriteTable(con, table_name, data)
-    print(paste("Connected to DuckDB and wrote table:", table_name, "from file:", file_name))
+    print(paste("Wrote table:", table_name, "from:", file_path))
     rm(data)
   }
 }
 
 con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
-tables_location <- 'Z:/CAPriCORN_raw_ds/parquet/'
+tables_location <- 'U:/CAPriCORN_raw_ds/parquet/'
 output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
 file_type <- '.parquet'
 
@@ -64,6 +71,15 @@ files <- list(
   "condition" = "condition",
   "diagnosis" = "diagnosis"
 )
+
+write_files_to_duckdb(files, tables_location, file_type, con)
+```
+
+```{r }
+tables_location <- 'U:/CAPriCORN_raw_ds/CAPriCORN/'
+file_type <- 'csv'
+files <- list(
+  "Encounter" = "Encounter")
 
 write_files_to_duckdb(files, tables_location, file_type, con)
 ```
@@ -185,9 +201,6 @@ outcomes$stroke <- ifelse(!is.na(outcomes$STROKE_dx_date), 1, 0)
 outcomes$hf <- ifelse(!is.na(outcomes$HF_dx_date), 1, 0)
 outcomes$mi <- ifelse(!is.na(outcomes$MI_dx_date), 1, 0)
 
-outcomes$cv_event <- ifelse(outcomes$afib==1 | outcomes$stroke==1 | outcomes$hf==1 | outcomes$mi==1, 1, 0)
-outcomes$cv_event_count <- outcomes$afib + outcomes$stroke + outcomes$hf + outcomes$mi
-
 df_1 <- readRDS(paste0(output_folder, "dataset_1_cohort.Rds"))
 df_1$cap_id <- as.character(df_1$cap_id)
 outcomes <- left_join(outcomes, df_1)
@@ -215,24 +228,113 @@ outcomes_first  <- outcomes  %>%
     group_by(cap_id) %>% 
     arrange(first_tsh_lab) %>% 
     filter(row_number() == 1)
-outcomes_first <- outcomes_first %>% filter(sex=='M' | sex=='F')
+cohort_outcomes <- outcomes_first %>% filter(sex=='M' | sex=='F')
 
-saveRDS(outcomes_first, paste0(output_folder, "cohort_outcomes.Rds"))
+```
+
+```{r}
+# calculate time to events
+cohort_outcomes$time_to_hf <- as.numeric(cohort_outcomes$HF_dx_date -cohort_outcomes$first_tsh_lab)
+cohort_outcomes$time_to_afib <- as.numeric(cohort_outcomes$AFIB_dx_date -cohort_outcomes$first_tsh_lab)
+cohort_outcomes$time_to_mi <- as.numeric(cohort_outcomes$MI_dx_date -cohort_outcomes$first_tsh_lab)
+cohort_outcomes$time_to_stroke <- as.numeric(cohort_outcomes$STROKE_dx_date -cohort_outcomes$first_tsh_lab)
+
+
+cohort_outcomes$time_hf_end <- as.numeric(cohort_outcomes$HF_dx_date - cohort_outcomes$last_tsh_lab)
+cohort_outcomes$hf[cohort_outcomes$time_hf_end>365] <- 0
+cohort_outcomes$time_to_hf[cohort_outcomes$time_hf_end>365] <- NA_integer_
+
+cohort_outcomes$time_afib_end <- as.numeric(cohort_outcomes$AFIB_dx_date - cohort_outcomes$last_tsh_lab)
+cohort_outcomes$afib[cohort_outcomes$time_afib_end>365] <- 0
+cohort_outcomes$time_to_afib[cohort_outcomes$time_afib_end>365] <- NA_integer_
+
+cohort_outcomes$time_mi_end <- as.numeric(cohort_outcomes$MI_dx_date - cohort_outcomes$last_tsh_lab)
+cohort_outcomes$mi[cohort_outcomes$time_mi_end>365] <- 0
+cohort_outcomes$time_to_mi[cohort_outcomes$time_mi_end>365] <- NA_integer_
+
+cohort_outcomes$time_stroke_end <- as.numeric(cohort_outcomes$STROKE_dx_date - cohort_outcomes$last_tsh_lab)
+cohort_outcomes$stroke[cohort_outcomes$time_stroke_end>365] <- 0
+cohort_outcomes$time_to_stroke[cohort_outcomes$time_stroke_end>365] <- NA_integer_
+
+cohort_outcomes <- cohort_outcomes %>%
+  mutate(
+    time_to_first_cv = pmin(time_to_hf, time_to_afib,
+                              time_to_mi, time_to_stroke,
+                              na.rm = TRUE),
+    first_cv_event = case_when(
+      time_to_first_cv == time_to_hf     ~ "HF",
+      time_to_first_cv == time_to_afib   ~ "AFIB",
+      time_to_first_cv == time_to_mi     ~ "MI",
+      time_to_first_cv == time_to_stroke ~ "Stroke",
+      TRUE                                ~ "none"
+    )
+  )
+cohort_outcomes$cv_event <- ifelse(cohort_outcomes$afib==1 | cohort_outcomes$stroke==1 | cohort_outcomes$hf==1 | cohort_outcomes$mi==1, 1, 0)
+cohort_outcomes$cv_event_count <- cohort_outcomes$afib + cohort_outcomes$stroke + cohort_outcomes$hf + cohort_outcomes$mi
+saveRDS(cohort_outcomes, paste0(output_folder, "cohort_outcomes.Rds"))
+
+```
+
+```{r}
+cohort_outcomes <- readRDS(paste0(output_folder, "cohort_outcomes.Rds"))
+duckdb::duckdb_register(con, "cohort_outcomes", cohort_outcomes)
+
+query_enc <- paste0("
+  WITH max_encounter AS (
+    SELECT 
+      STUDY_ID,
+      MAX(CAST(ADMIT_DATE AS DATE)) AS max_encounter_date
+    FROM Encounter
+    WHERE ADMIT_DATE IS NOT NULL 
+      AND ADMIT_DATE != ''          -- filter empty strings
+      AND LENGTH(ADMIT_DATE) = 10   -- ensure valid date length YYYY-MM-DD
+    GROUP BY STUDY_ID
+  ),
+  combined AS (
+    SELECT 
+      o.cap_id,
+      o.last_tsh_lab,
+      e.max_encounter_date,
+      DATE_ADD(o.last_tsh_lab, INTERVAL 1 YEAR) AS one_year_after_tsh
+    FROM cohort_outcomes o
+    LEFT JOIN max_encounter e
+      ON o.cap_id = e.STUDY_ID
+  )
+  
+  SELECT 
+    cap_id,
+    last_tsh_lab,
+    max_encounter_date,
+    one_year_after_tsh,
+    LEAST(
+      one_year_after_tsh,
+      max_encounter_date
+    ) AS end_obs_date
+  FROM combined
+")
+
+max_obs_date <- dbGetQuery(con, query_enc)
+cohort_outcomes <- left_join(cohort_outcomes, max_obs_date)
+saveRDS(cohort_outcomes, paste0(output_folder, "cohort_outcomes.Rds"))
+
 ```
 
 
 ```{r}
 
-all_variables_in_table1_rows <- c("episode_span_days", "n_tsh_labs", "afib", "stroke", "mi", "hf", "cv_event", "cv_event_count", "hypo_dx",
+all_variables_in_table1_rows <- c("episode_span_days", "n_tsh_labs", "afib", "time_to_afib", "stroke", "time_to_stroke", "mi", "time_to_mi", 
+"hf", "time_to_hf", "cv_event", "time_to_first_cv", "first_cv_event", "cv_event_count", "hypo_dx",
                                   "age_enc", "sex", "race_cat", "hispanic")
 categorical_vars <- c("afib", "stroke", "mi", "hf", "cv_event", "cv_event_count", "hypo_dx",
-                                  "sex", "race_cat", "hispanic")
-nonnormal <- c("episode_span_days", "n_tsh_labs", "age_enc")
+                                  "sex", "race_cat", "hispanic", "first_cv_event")
+nonnormal <- c("episode_span_days", "n_tsh_labs", "age_enc", "time_to_afib", "time_to_hf", "time_to_mi", "time_to_stroke", "time_to_first_cv")
 table_2 <- tableone::CreateTableOne(vars = all_variables_in_table1_rows, strata="cv_event",
-                                    data = outcomes_first,
+                                    data = cohort_outcomes,
                                     factorVars = categorical_vars,
                                     addOverall = TRUE)
 table_2 <- as.data.frame(print(table_2, showAllLevels = TRUE, explain = FALSE, pDigits = 3, smd=F, nonnormal=nonnormal,
                                formatOptions = list(big.mark = ","))) 
 print(table_2)
 ```
+
+
