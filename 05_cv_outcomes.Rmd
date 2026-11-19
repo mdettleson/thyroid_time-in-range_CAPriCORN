@@ -58,14 +58,14 @@ write_files_to_duckdb <- function(files, tables_location, file_type, con) {
 }
 
 con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
-tables_location <- 'U:/CAPriCORN_raw_ds/parquet/'
+tables_location <- 'U:/CAPriCORN_raw_ds/parquet'
 output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
-file_type <- '.parquet'
+file_type <- 'parquet'
 
 ```
 
 ```{r }
-icd10_snomed_crosswalk <- read.csv(paste0(tables_location, "icd10_snomed_crosswalk.csv"))
+icd10_snomed_crosswalk <- read.csv(paste0(tables_location, "/icd10_snomed_crosswalk.csv"))
 
 files <- list(
   "condition" = "condition",
