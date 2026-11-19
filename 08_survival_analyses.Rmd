@@ -1,0 +1,744 @@
+---
+title: "08 Survival Analyses"
+output: html_document
+date: "2026-10-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+packages <- c("tidyverse", "survival", "data.table", "broom", "tableone", "flextable", "purrr", "officer")
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+results <- "//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/results/"
+
+tir_interpolated_blocks <- readRDS("Y:/staff/rbaccile/Matt/output/tir_interpolated_blocks_new.rds")
+tir_interpolated_blocks_v2 <- readRDS("Y:/staff/rbaccile/Matt/output/tir_interpolated_blocks_v2.rds")
+
+cohort <- readRDS("Y:/staff/rbaccile/Matt/output/cohort_outcomes.Rds")
+med_flags <- readRDS("Y:/staff/rbaccile/Matt/output/med_flags.Rds")
+rxcui <- read.csv('U:/CAPriCORN_raw_ds/CAPriCORN/med_covariate_rxnorm.csv')
+
+# All medication flag columns
+rx_vars <- grep("^rx_", names(med_flags), value = TRUE)
+rx_vars
+
+# Drop flags that are constant (all 0 or all 1) or too rare to estimate
+prev <- colMeans(med_flags[, rx_vars], na.rm = TRUE)
+n_pos <- colSums(med_flags[, rx_vars], na.rm = TRUE)
+data.frame(rx_vars, n_pos, prev = round(prev, 4)) %>% arrange(desc(n_pos))
+
+rx_keep <- rx_vars[n_pos >= 50 & prev < 1]     # minimum 50 patients on the drug; adjust as needed
+
+comorb_days <- readRDS("Y:/staff/rbaccile/Matt/output/comorb_days.Rds")
+comorb_vars <- sub("^dxday_", "", grep("^dxday_", names(comorb_days), value = TRUE))
+
+comorb_base <- readRDS("Y:/staff/rbaccile/Matt/output/comorb_base.Rds")
+base_vars <- grep("_base$", names(comorb_base), value = TRUE)
+
+```
+
+
+```{r}
+## Create time-varying exposure dataframe
+cohort <- cohort %>%
+    ungroup %>%
+  left_join(med_flags) %>%
+  left_join(comorb_base) %>%
+  filter(rx_antithyroid_exclusion!=1) %>%
+  mutate(# Calculate censoring date — minimum of 1 year after last TSH or last encounter
+        censor_date = end_obs_date,
+        race_cat  = relevel(factor(race_cat),  ref = "White"),
+        hispanic  = relevel(factor(hispanic),  ref = "Not Hispanic")
+    ,
+    
+    # Ensure event is integer
+    cv_event = as.integer(cv_event),
+    
+    surv_time = case_when(
+      cv_event == 1 ~ time_to_first_cv,
+      cv_event == 0 ~ as.numeric(as.Date(censor_date) - as.Date(first_tsh_lab)),
+      TRUE          ~ NA_real_
+    )
+  )
+
+# Verify — check for issues
+cohort %>%
+  summarise(
+    n               = n(),
+    n_events        = sum(cv_event == 1, na.rm = TRUE),
+    pct_events      = round(mean(cv_event == 1, na.rm = TRUE) * 100, 1),
+    n_negative_time = sum(surv_time < 0,  na.rm = TRUE),
+    n_zero_time     = sum(surv_time == 0, na.rm = TRUE),
+    n_missing_time  = sum(is.na(surv_time)),
+    median_time     = median(surv_time, na.rm = TRUE),
+    min_time        = min(surv_time,    na.rm = TRUE),
+    max_time        = max(surv_time,    na.rm = TRUE)
+  )
+
+# Check time distribution by event status
+cohort %>%
+  group_by(cv_event) %>%
+  summarise(
+    n           = n(),
+    median_time = median(surv_time, na.rm = TRUE),
+    q1          = quantile(surv_time, 0.25, na.rm = TRUE),
+    q3          = quantile(surv_time, 0.75, na.rm = TRUE),
+    min_time    = min(surv_time, na.rm = TRUE),
+    max_time    = max(surv_time, na.rm = TRUE),
+    .groups     = "drop"
+  )
+
+```
+
+
+```{r}
+# ---- 1. Yearly proportion of time above range (12 x 30-day blocks) ------
+yearly <- tir_interpolated_blocks %>%
+  group_by(episode_id, period) %>%
+  summarise(
+    n_blocks = n(),
+    n_labs   = sum(!is.na(tsh_value)),                   # real labs behind the year
+    TAR_A   = mean(TAR_A),                              
+    TIR_A   = mean(TIR_A),
+    TBR_A   = mean(TBR_A),
+    TAR_B   = mean(TAR_B),                              
+    TIR_B   = mean(TIR_B),
+    TBR_B   = mean(TBR_B),
+    TAR_C   = mean(TAR_C),                              
+    TIR_C   = mean(TIR_C),
+    TBR_C   = mean(TBR_C),
+    .groups  = "drop"
+  ) %>%
+  filter(n_blocks >= 6) 
+
+yearly_v2 <-  tir_interpolated_blocks_v2 %>%
+  group_by(episode_id, period) %>%
+  summarise(
+    n_blocks_v2 = n(),
+    n_labs_v2   = sum(!is.na(tsh_value_v2)),                   # real labs behind the year
+    TAR_A_v2   = mean(TAR_A_v2),                              
+    TIR_A_v2   = mean(TIR_A_v2),
+    TBR_A_v2   = mean(TBR_A_v2),
+    TAR_B_v2   = mean(TAR_B_v2),                              
+    TIR_B_v2   = mean(TIR_B_v2),
+    TBR_B_v2   = mean(TBR_B_v2),
+    TAR_C_v2   = mean(TAR_C_v2),                              
+    TIR_C_v2   = mean(TIR_C_v2),
+    TBR_C_v2   = mean(TBR_C_v2),
+    .groups  = "drop"
+  ) %>%
+  filter(n_blocks_v2 >= 6)    
+
+yearly <- left_join(yearly, yearly_v2)
+
+# ---- 2. Person-year follow-up, exposure = PREVIOUS year -----------------
+base <- cohort %>% ungroup() %>% distinct(episode_id, .keep_all = TRUE) %>%
+  select(cap_id, episode_id, surv_time, cv_event, race_cat, hispanic, sex, age_enc, rx_vars)
+
+tv <- base %>%
+  mutate(max_period = ceiling(surv_time / 360)) %>%
+  uncount(max_period, .id = "period") %>%                    # one row per year of follow-up
+  mutate(tstart = (period - 1) * 360,
+         tstop  = pmin(period * 360, surv_time),
+         event_tv = as.integer(cv_event == 1 & tstop >= surv_time)) %>%
+  filter(tstart < tstop) %>%
+  left_join(yearly %>% mutate(period = period + 1),          # shift: year k exposure -> year k+1 follow-up
+            by = c("episode_id", "period")) %>%
+  filter(period >= 2) %>%                                  # year 1 has no prior-year exposure
+    mutate(TIR_A_10 = TIR_A * 10,
+         TIR_B_10 = TIR_B * 10,
+         TIR_C_10 = TIR_C * 10,
+         TAR_A_10 = TAR_A * 10,
+         TAR_B_10 = TAR_B * 10,
+         TAR_C_10 = TAR_C * 10,
+         TBR_A_10 = TBR_A * 10,
+         TBR_B_10 = TBR_B * 10,
+         TBR_C_10 = TBR_C * 10,
+       TIR_A_10_v2 = TIR_A_v2 * 10,
+         TIR_B_10_v2 = TIR_B_v2 * 10,
+         TIR_C_10_v2 = TIR_C_v2 * 10,
+         TAR_A_10_v2 = TAR_A_v2 * 10,
+         TAR_B_10_v2 = TAR_B_v2 * 10,
+         TAR_C_10_v2 = TAR_C_v2 * 10,
+         TBR_A_10_v2 = TBR_A_v2 * 10,
+         TBR_B_10_v2 = TBR_B_v2 * 10,
+        TBR_C_10_v2 = TBR_C_v2 * 10)  
+
+tv %>%
+  summarise(
+    max_tstart   = max(tstart),
+    max_tstop    = max(tstop),
+    max_surv     = max(surv_time),
+    mean_interval = round(mean(tstop - tstart), 1)
+  )
+
+## Add comorbidities
+tv <- tv %>%
+  left_join(comorb_days, by = "cap_id") %>%
+  mutate(across(all_of(paste0("dxday_", comorb_vars)),
+                ~ as.integer(!is.na(.x) & .x <= tstart),
+                .names = "{sub('dxday_', '', .col)}_tv")) %>%
+  select(-starts_with("dxday_"))
+
+```
+
+# Summary table
+```{r}
+summary_tir <- tv %>% group_by(cap_id, episode_id) %>%
+  summarise(n_blocks = sum(n_blocks),
+    n_labs   = sum(n_labs),                   # real labs behind the year
+    TAR_A   = mean(TAR_A),                              
+    TIR_A   = mean(TIR_A),
+    TBR_A   = mean(TBR_A),
+    TAR_B   = mean(TAR_B),                              
+    TIR_B   = mean(TIR_B),
+    TBR_B   = mean(TBR_B),
+    TAR_C   = mean(TAR_C),                              
+    TIR_C   = mean(TIR_C),
+    TBR_C   = mean(TBR_C),
+    TAR_A_v2   = mean(TAR_A_v2),                              
+    TIR_A_v2   = mean(TIR_A_v2),
+    TBR_A_v2   = mean(TBR_A_v2),
+    TAR_B_v2   = mean(TAR_B_v2),                              
+    TIR_B_v2   = mean(TIR_B_v2),
+    TBR_B_v2   = mean(TBR_B_v2),
+    TAR_C_v2   = mean(TAR_C_v2),                              
+    TIR_C_v2   = mean(TIR_C_v2),
+    TBR_C_v2   = mean(TBR_C_v2),
+    .groups  = "drop"
+  )
+
+cohort <- left_join(summary_tir, cohort)
+# ---- 1. Labels ---------------------------------------------------------
+comorb_lab <- c(anemia = "Anemia", cvd = "Cardiovascular disease (baseline)", ckd = "CKD",
+  dementia = "Dementia", dm1 = "Diabetes mellitus type 1", dm2 = "Diabetes mellitus type 2",
+  ibd = "GI disease - IBD and intestinal malabsorption", pud = "GI disease - peptic ulcer disease",
+  hld = "Hyperlipidemia", htn = "Hypertension", liver = "Liver disease", malignancy = "Malignancy",
+  mdd_anx = "MDD/Anxiety", obesity = "Obesity", oa = "Osteoarthritis", osteoporosis = "Osteoporosis",
+  pregnancy = "Pregnancy (active - censoring event)", pulm = "Pulmonary disease",
+  ra_ctd = "Rheumatoid arthritis and other CTD", sleep = "Sleep disorders")
+
+base_use <- setdiff(base_vars, "NA_base")                       # drops the NA group column
+names(base_use) <- comorb_lab[sub("_base$", "", base_use)]      # nice names
+base_use <- base_use[!is.na(names(base_use))]
+
+# medication nice names come from the category names themselves
+rx_lab  <- setNames(unique(rxcui$medication_category),
+                    paste0("rx_", make_clean_names(unique(rxcui$medication_category))))
+rx_use  <- intersect(rx_keep, names(rx_lab))
+names(rx_use) <- rx_lab[rx_use]; rx_use <- setNames(rx_use, names(rx_use))
+
+tir  <- c("TIR_A","TAR_A","TBR_A","TIR_B","TAR_B","TBR_B","TIR_C","TAR_C","TBR_C")
+mk_tir <- function(suffix = "") {
+  one <- function(prefix) setNames(paste0(prefix, "_", c("A", "B", "C"), suffix),
+                                   paste("Method", c("A", "B", "C")))
+  list("Time in range"       = one("TIR"),
+       "Time above range"    = one("TAR"),
+       "Time below range"    = one("TBR"))
+}
+base_use <- base_use[order(tolower(names(base_use)))]
+rx_use   <- rx_use[order(tolower(names(rx_use)))]
+groups <- list(
+  "Observation Characteristics" = c("Blocks, n" = "n_blocks", "TSH labs, n" = "n_labs",
+                                    "Follow-up, days" = "surv_time"),
+  "Time In Range, Linear Rise, %" = mk_tir(""),
+  "Time In Range, Quick Rise, %"  = mk_tir("_v2"),
+  "Cardiovascular Outcomes" = c("Atrial fibrillation, n (%)" = "afib", "Stroke, n (%)" = "stroke",
+                                "Myocardial infarction, n (%)" = "mi", "Heart Failure, n (%)" = "hf"),
+  "Baseline Comorbidities, n (%)" = base_use,
+  "Medication Exposures, n (%)" = rx_use,
+  "Demographics" = c("Race, n (%)" = "race_cat", "Ethnicity, n (%)" = "hispanic",
+                     "Sex (male), n (%)" = "sex", "Age at Hypothyroidism Diagnosis, years" = "age_enc")
+)
+all_v <- unlist(groups, use.names = FALSE)
+
+# ---- 2. tableone -------------------------------------------------------
+d <- cohort %>% ungroup() %>%
+  mutate(across(all_of(c(tir, paste0(tir, "_v2"))), ~ .x * 100))        # proportions -> %
+
+cat_v  <- intersect(c(categorical_vars, base_use, rx_use, "afib","stroke","mi","hf",
+                      "race_cat","hispanic","sex"), all_v)
+nonnorm <- setdiff(all_v, cat_v)
+
+t2 <- CreateTableOne(vars = all_v, strata = "cv_event", data = d,
+                     factorVars = cat_v, addOverall = TRUE)
+m <- print(t2, showAllLevels = FALSE, nonnormal = nonnorm, catDigits = 1, contDigits = 1,
+           pDigits = 3, smd = TRUE, test = TRUE, printToggle = FALSE, explain = FALSE,
+           formatOptions = list(big.mark = ","))
+
+# ---- 3. Clean the matrix ----------------------------------------------
+fmt_commas <- function(s) {
+  s <- as.character(s)
+  mt <- gregexpr("(?<![\\d.,])\\d{4,}(?!\\d)", s, perl = TRUE)
+  regmatches(s, mt) <- lapply(regmatches(s, mt), function(v)
+    format(as.numeric(v), big.mark = ",", scientific = FALSE, trim = TRUE))
+  s
+}
+rn <- rownames(m); is_level <- grepl("^\\s", rn); nm <- trimws(rn)
+var_of <- ifelse(is_level, NA, sub(" = .*$| \\(.*$", "", nm))
+
+keep <- intersect(c("Overall", "0", "1", "p", "SMD"), colnames(m))
+df <- as.data.frame(m[, keep, drop = FALSE], stringsAsFactors = FALSE)
+df[] <- lapply(df, function(x) trimws(gsub("\\(\\s+", "(", fmt_commas(x))))
+df$p[df$p == "NA"] <- ""; df$SMD[df$SMD == "NA"] <- ""
+
+# integer-like variables: drop ".0"
+int_rows <- which(var_of %in% c("n_blocks","n_labs","surv_time","age_enc"))
+df[int_rows, c("Overall","0","1")] <- lapply(df[int_rows, c("Overall","0","1")],
+                                             function(x) gsub("\\.0(?!\\d)", "", x, perl = TRUE))
+
+# ---- 4. Assemble rows by group ----------------------------------------
+blank <- function() setNames(rep("", ncol(df)), names(df))
+rows <- list(); kind <- character()
+add <- function(lbl, vals, k) {
+  rows[[length(rows) + 1]] <<- c(Characteristic = lbl, vals)
+  kind <<- c(kind, k)
+}
+
+# one variable: its row, plus any nested factor levels
+add_var <- function(lbl, v, k) {
+  i <- which(var_of == v)
+  if (!length(i)) return(invisible())
+  add(lbl, unlist(df[i[1], ]), k)
+  j <- i[1] + 1
+  while (j <= nrow(df) && is_level[j]) { add(nm[j], unlist(df[j, ]), "level"); j <- j + 1 }
+}
+
+for (g in names(groups)) {
+  add(g, blank(), "group")
+  items <- groups[[g]]
+  if (is.list(items)) {                          # time-in-range sections: measure -> methods
+    for (measure in names(items)) {
+      add(measure, blank(), "sub")
+      for (meth in names(items[[measure]])) add_var(meth, items[[measure]][[meth]], "method")
+    }
+  } else {                                       # all other sections
+    for (lbl in names(items)) add_var(lbl, items[[lbl]], "char")
+  }
+}
+out <- as.data.frame(do.call(rbind, rows), stringsAsFactors = FALSE)
+nn <- unlist(df[which(nm == "n")[1], c("Overall", "0", "1")])
+names(out) <- c("Characteristic", keep)
+
+ft <- flextable(out) %>%
+  set_header_labels(Characteristic = "Characteristic",
+                    Overall = paste0("Overall\n(n = ", nn[1], ")"),
+                    `0` = paste0("No CV event\n(n = ", nn[2], ")"),
+                    `1` = paste0("CV event\n(n = ", nn[3], ")"),
+                    p = "p-value") %>%
+  italic(i = which(kind == "group"), j = 1) %>%
+  bold(i = which(kind %in% c("char", "sub")), j = 1) %>%
+  padding(i = which(kind %in% c("char", "sub")), j = 1, padding.left = 10) %>%
+  padding(i = which(kind %in% c("method", "level")), j = 1, padding.left = 24) %>%
+  bold(part = "header") %>%
+  align(j = -1, align = "center", part = "all") %>%
+  fontsize(size = 9, part = "all") %>%
+  padding(padding.top = 1, padding.bottom = 1, part = "all") %>%
+  add_footer_lines(c("Median [IQR] for continuous variables; n (%) for categorical variables. Binary variables show the '1' level.",
+                     "SMD = standardized mean difference (CV event vs. no CV event). Methods A, B, and C are the three TSH range definitions.")) %>%
+  autofit()
+ft
+flextable::save_as_docx(ft, path = file.path(results, "table1.docx"))
+```
+
+
+# Unadjusted continuous - TIR method 1
+```{r}
+exposures <- paste0(rep(c("TIR", "TAR", "TBR"), each = 3), "_", c("A", "B", "C"), "_10")
+
+fit_one <- function(x) {
+  f <- coxph(reformulate(x, response = "Surv(tstart, tstop, event_tv)"),
+             data = tv, cluster = cap_id)
+  tidy(f, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term == x) %>%
+    mutate(exposure = x)
+}
+
+res <- map_dfr(exposures, fit_one) %>%
+  mutate(
+    Measure = c(TIR = "Time in range", TAR = "Time above range",
+                TBR = "Time below range")[substr(exposure, 1, 3)],
+    Method  = paste("Method", substr(exposure, 5, 5)),
+    HR      = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high),
+    p       = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)),
+    sig     = p.value < 0.05
+  )
+
+wide <- res %>%
+  select(Method, Measure, HR, p) %>%
+  pivot_wider(names_from = Measure, values_from = c(HR, p), names_glue = "{Measure}_{.value}") %>%
+  select(Method,
+         `Time in range_HR`, `Time in range_p`,
+         `Time above range_HR`, `Time above range_p`,
+         `Time below range_HR`, `Time below range_p`)
+
+# 3. Flextable
+ft <- flextable(wide) %>%
+  set_header_labels(Method = "Method",
+                    `Time in range_HR` = "HR (95% CI)", `Time in range_p` = "p",
+                    `Time above range_HR` = "HR (95% CI)", `Time above range_p` = "p",
+                    `Time below range_HR` = "HR (95% CI)", `Time below range_p` = "p") %>%
+  add_header_row(values = c("", "Time in range", "Time above range", "Time below range"),
+                 colwidths = c(1, 2, 2, 2)) %>%
+  set_caption("Association of time in range with cardiovascular events (unadjusted)") %>%
+  bold(part = "header") %>%
+  align(part = "header", align = "center") %>%
+  align(j = 2:7, align = "center", part = "body") %>%
+  fontsize(size = 10, part = "all") %>%
+  padding(padding.top = 3, padding.bottom = 3, part = "all") %>%
+  border_remove() %>%
+  hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+  hline_bottom(part = "body", border = fp_border(width = 1.5)) %>%
+  add_footer_lines(c(
+    "Unadjusted Cox proportional hazards models with time-varying exposure; each cell is a separate model.",
+    "HR = hazard ratio per 10 percentage-point increase in the proportion of the prior year; robust standard errors clustered by patient. Bold = p < 0.05.",
+    "Methods A, B, and C are the three TSH range definitions (A: 0.4-4.5, B: 0.1-10, C: 0.4-6 mIU/L).")) %>%
+  autofit()
+
+# 4. Bold significant results
+sig <- res %>% filter(sig)
+for (i in seq_len(nrow(sig))) {
+  r <- which(wide$Method == sig$Method[i])
+  ft <- bold(ft, i = r, j = paste0(sig$Measure[i], c("_HR", "_p")), part = "body")
+}
+ft
+
+save_as_docx(ft, path = file.path(results, "cox_tir_tar_tbr_unadjusted.docx"))
+```
+
+# Adjusted continuous - TIR method 1
+```{r cox regressions}
+exposures <- paste0(rep(c("TIR", "TAR", "TBR"), each = 3), "_", c("A", "B", "C"), "_10")
+covs_tv   <- paste0(comorb_vars, "_tv")
+
+# 1. Fit models, keeping ALL terms
+run_cox_all <- function(x, data) {
+  fit <- coxph(reformulate(c(x, "race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_keep),
+                           response = "Surv(tstart, tstop, event_tv)"),
+               data = data, cluster = cap_id)
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    mutate(exposure = x, is_exposure = term == x)
+}
+res_all <- map_dfr(exposures, run_cox_all, data = tv)   # tv must hold the _tv and rx columns
+
+label_term <- function(term, measure) {
+  case_when(
+    grepl("^T(IR|AR|BR)_[ABC]_10$", term) ~ paste0(measure, " (per 10 percentage points)"),
+    term == "race_catAsian" ~ "Race: Asian (vs. White)",
+    term == "race_catBlack or African American" ~ "Race: Black or African American",
+    term == "race_catOther" ~ "Race: Other",
+    term == "race_catUnknown" ~ "Race: Unknown",
+    term == "hispanicHispanic" ~ "Ethnicity: Hispanic (vs. not Hispanic)",
+    term == "hispanicUnknown" ~ "Ethnicity: Unknown",
+    term == "sexM" ~ "Sex: Male (vs. female)",
+    term == "age_enc" ~ "Age at encounter (per year)",
+    sub("_tv$", "", term) %in% names(comorb_lab) & grepl("_tv$", term) ~
+      paste0("Comorbidity: ", comorb_lab[sub("_tv$", "", term)]),
+    term %in% names(rx_lab) ~ paste0("Medication: ", rx_lab[term]),
+    TRUE ~ term)
+}
+
+res_all <- res_all %>%
+  mutate(Measure = c(TIR = "Time in range", TAR = "Time above range",
+                     TBR = "Time below range")[substr(exposure, 1, 3)],
+         Method  = paste("Method", substr(exposure, 5, 5)),
+         label   = label_term(term, Measure[1]),
+         HR      = ifelse(is.na(estimate), "", sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high)),
+         p       = ifelse(is.na(p.value), "", ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value))),
+         sig     = !is.na(p.value) & p.value < 0.05) %>%
+  group_by(Measure) %>%
+  mutate(label = ifelse(is_exposure, paste0(Measure, " (per 10 percentage points)"), label)) %>%
+  ungroup()
+
+# Row order: exposure, demographics, comorbidities (A-Z), medications (A-Z)
+order_key <- function(lbl, is_exp) {
+  grp <- case_when(is_exp ~ 0, grepl("^(Race|Ethnicity|Sex|Age)", lbl) ~ 1,
+                   grepl("^Comorbidity", lbl) ~ 2, grepl("^Medication", lbl) ~ 3, TRUE ~ 4)
+  paste0(grp, tolower(lbl))
+}
+
+# One flextable per measure
+make_ft <- function(meas) {
+  d <- res_all %>% filter(Measure == meas)
+  wide <- d %>% select(label, is_exposure, Method, HR, p) %>%
+    pivot_wider(names_from = Method, values_from = c(HR, p), names_glue = "{Method}_{.value}") %>%
+    arrange(order_key(label, is_exposure))
+  sigw <- d %>% filter(sig) %>% select(label, Method)
+
+  ft <- flextable(wide %>% select(label, starts_with("Method A"), starts_with("Method B"),
+                                  starts_with("Method C"))) %>%
+    set_header_labels(label = "Characteristic",
+                      `Method A_HR` = "HR (95% CI)", `Method A_p` = "p",
+                      `Method B_HR` = "HR (95% CI)", `Method B_p` = "p",
+                      `Method C_HR` = "HR (95% CI)", `Method C_p` = "p") %>%
+    add_header_row(values = c("", "Method A", "Method B", "Method C"), colwidths = c(1, 2, 2, 2)) %>%
+    set_caption(paste0("Adjusted Cox models: ", tolower(meas), " and cardiovascular events")) %>%
+    bold(part = "header") %>% align(part = "header", align = "center") %>%
+    align(j = 2:7, align = "center", part = "body") %>%
+    bold(i = which(wide$is_exposure), part = "body") %>%
+    fontsize(size = 8, part = "all") %>%
+    padding(padding.top = 1, padding.bottom = 1, part = "all") %>%
+    border_remove() %>%
+    hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+    hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+    hline_bottom(part = "body", border = fp_border(width = 1.5)) %>%
+    add_footer_lines(c("Each Method column is a separate Cox model with time-varying exposure; robust SEs clustered by patient.",
+                       "Adjusted for all variables listed. HR = hazard ratio. Bold = p < 0.05 (covariates) or exposure row.",
+                       "Methods A, B, C: TSH range definitions (A: 0.4-4.5, B: 0.1-10, C: 0.4-6 mIU/L).")) %>%
+    width(j = 1, width = 3) %>% width(j = c(2, 4, 6), width = 1.3) %>% width(j = c(3, 5, 7), width = 0.55)
+
+  for (m in c("Method A", "Method B", "Method C")) {
+    r <- which(wide$label %in% sigw$label[sigw$Method == m])
+    ft <- bold(ft, i = r, j = paste0(m, c("_HR", "_p")), part = "body")
+  }
+  ft
+}
+
+ft_tir <- make_ft("Time in range")
+ft_tar <- make_ft("Time above range")
+ft_tbr <- make_ft("Time below range")
+
+save_as_docx("Time in range" = ft_tir, "Time above range" = ft_tar, "Time below range" = ft_tbr,
+             path = file.path(results, "cox_tir_tar_tbr_adjusted_all_terms.docx"),
+             pr_section = prop_section(page_size = page_size(orient = "landscape")))
+```
+
+
+
+# Sensitivity analysis, baseline comorbidities only - TIR method 1
+```{r}
+
+tv_b <- tv %>%
+  left_join(comorb_base, by = "cap_id") %>%
+  mutate(across(all_of(base_vars), ~ coalesce(.x, 0L)))
+
+f_base <- reformulate(c("TAR_A_10", "race_cat", "hispanic", "sex", "age_enc", base_vars),
+                      response = "Surv(tstart, tstop, event_tv)")
+cox_base <- coxph(f_base, data = tv_b, cluster = cap_id)
+
+# Compare the exposure estimate across the three specifications
+cox_none <- coxph(Surv(tstart, tstop, event_tv) ~ TAR_A_10 + race_cat + hispanic + sex + age_enc,
+                  data = tv_b, cluster = cap_id)
+cox_tv  <- coxph(reformulate(c("TAR_A_10", "race_cat", "hispanic", "sex", "age_enc", covs_tv),
+                              response = "Surv(tstart, tstop, event_tv)"),
+                  data = tv, cluster = cap_id)   
+
+bind_rows(
+  broom::tidy(cox_none, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "No comorbidities"),
+  broom::tidy(cox_base, exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "Baseline comorbidities"),
+  broom::tidy(cox_tv,  exponentiate = TRUE, conf.int = TRUE) %>% mutate(model = "Time-varying comorbidities")
+) %>% filter(term == "TAR_A_10") %>%
+  transmute(model, HR = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high))
+```
+
+# Sensitivity analysis, categorical exposure - TIR method 1
+```{r}
+
+exposures <- paste0(rep(c("TIR","TAR","TBR"), each = 3), "_", c("A","B","C"), "_10")
+
+# Category builder
+# x is on the 0-10 scale, so pct = % of the prior year (0-100)
+make_cat <- function(x, type) {
+  pct <- round(x * 10, 6)                     # avoids floating-point misses at 0 and 100
+  if (type == "TIR") {
+    # reference = fully in range; categories describe time OUT of range getting larger
+    factor(case_when(pct == 100 ~ "100% (ref)",
+                     pct > 75   ~ ">75-<100%",
+                     pct > 50   ~ ">50-75%",
+                     pct > 25   ~ ">25-50%",
+                     TRUE       ~ "0-25%"),
+           levels = c("100% (ref)", ">75-<100%", ">50-75%", ">25-50%", "0-25%"))
+  } else {
+    # TAR and TBR: reference = no time above/below range
+    factor(case_when(pct == 0   ~ "0% (ref)",
+                     pct <= 25  ~ ">0-25%",
+                     pct <= 50  ~ ">25-50%",
+                     pct < 100  ~ ">50-<100%",
+                     TRUE       ~ "100%"),
+           levels = c("0% (ref)", ">0-25%", ">25-50%", ">50-<100%", "100%"))
+  }
+}
+
+# Model for one exposure
+run_cox_cat <- function(x, data) {
+  d <- data
+  d$exp_cat <- make_cat(d[[x]], substr(x, 1, 3))
+
+  covs <- c("race_cat", "hispanic", "sex", "age_enc", covs_tv)
+  f <- reformulate(c("exp_cat", covs), response = "Surv(tstart, tstop, event_tv)")
+  fit <- coxph(f, data = d, cluster = cap_id)
+
+  # Trend: category rank entered as a single numeric term
+  d$exp_score <- as.integer(d$exp_cat) - 1
+  fit_tr <- coxph(reformulate(c("exp_score", covs), response = "Surv(tstart, tstop, event_tv)"),
+                  data = d, cluster = cap_id)
+  p_trend <- summary(fit_tr)$coefficients["exp_score", "Pr(>|z|)"]
+
+  counts <- d %>% group_by(category = exp_cat) %>%
+    summarise(person_years = n(), events = sum(event_tv), .groups = "drop")
+
+  est <- broom::tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(grepl("^exp_cat", term)) %>%
+    transmute(category = sub("^exp_cat", "", term),
+              HR = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high),
+              p  = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)))
+
+  counts %>%
+    mutate(category = as.character(category)) %>%
+    left_join(est, by = "category") %>%
+    mutate(HR = ifelse(is.na(HR), "1.00 (ref)", HR),
+           p  = ifelse(is.na(p), "", p),
+           exposure = x,
+           p_trend = ifelse(p_trend < 0.001, "<0.001", sprintf("%.3f", p_trend))) %>%
+    select(exposure, category, person_years, events, HR, p, p_trend)
+}
+
+# Run for all nine exposures 
+results_cat <- map_dfr(exposures, run_cox_cat, data = tv)
+
+meas_lab <- c(TIR = "Time in range", TAR = "Time above range", TBR = "Time below range")
+
+res <- results_cat %>%
+  mutate(Measure = meas_lab[substr(exposure, 1, 3)],
+         Method  = paste("Method", substr(exposure, 5, 5)),
+         cell    = HR,
+         ev      = format(events, big.mark = ","),
+         py      = format(person_years, big.mark = ","),
+         order   = match(category, unique(category)))
+
+# category order within each measure (as built by make_cat)
+cat_order <- res %>% distinct(Measure, category) %>%
+  group_by(Measure) %>% mutate(ord = row_number()) %>% ungroup()
+
+wide <- res %>%
+  select(Measure, category, Method, HR, p, ev, py) %>%
+  pivot_wider(names_from = Method, values_from = c(HR, p, ev, py),
+              names_glue = "{Method}_{.value}") %>%
+  left_join(cat_order, by = c("Measure", "category")) %>%
+  arrange(factor(Measure, levels = meas_lab), ord)
+
+trend <- res %>% distinct(Measure, Method, p_trend) %>%
+  group_by(Measure) %>%
+  summarise(txt = paste0(sub("Method ", "", Method), ": ", p_trend, collapse = "; "),
+            .groups = "drop")
+
+# Build rows: a header row per measure, then its categories
+rows <- list(); kind <- character()
+for (m in meas_lab) {
+  tt <- trend$txt[trend$Measure == m]
+  rows[[length(rows) + 1]] <- tibble(Category = paste0(m, "  (p for trend, ", tt, ")"),
+    `Method A_HR` = "", `Method A_p` = "", `Method A_ev` = "",
+    `Method B_HR` = "", `Method B_p` = "", `Method B_ev` = "",
+    `Method C_HR` = "", `Method C_p` = "", `Method C_ev` = "")
+  kind <- c(kind, "hdr")
+  d <- wide %>% filter(Measure == m)
+  rows[[length(rows) + 1]] <- d %>% transmute(Category = category,
+    `Method A_HR`, `Method A_p`, `Method A_ev`,
+    `Method B_HR`, `Method B_p`, `Method B_ev`,
+    `Method C_HR`, `Method C_p`, `Method C_ev`)
+  kind <- c(kind, rep("row", nrow(d)))
+}
+out <- bind_rows(rows)
+
+ft <- flextable(out) %>%
+  set_header_labels(Category = "Share of prior year",
+    `Method A_HR` = "HR (95% CI)", `Method A_p` = "p", `Method A_ev` = "Events",
+    `Method B_HR` = "HR (95% CI)", `Method B_p` = "p", `Method B_ev` = "Events",
+    `Method C_HR` = "HR (95% CI)", `Method C_p` = "p", `Method C_ev` = "Events") %>%
+  add_header_row(values = c("", "Method A", "Method B", "Method C"), colwidths = c(1, 3, 3, 3)) %>%
+  set_caption("Cardiovascular events by category of time in, above, and below TSH range in the prior year") %>%
+  bold(part = "header") %>% align(part = "header", align = "center") %>%
+  align(j = 2:10, align = "center", part = "body") %>%
+  bold(i = which(kind == "hdr"), part = "body") %>%
+  italic(i = which(kind == "hdr"), j = 1, part = "body") %>%
+  padding(i = which(kind == "row"), j = 1, padding.left = 18) %>%
+  fontsize(size = 9, part = "all") %>%
+  padding(padding.top = 2, padding.bottom = 2, part = "all") %>%
+  border_remove() %>%
+  hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+  hline_bottom(part = "body", border = fp_border(width = 1.5)) %>%
+  add_footer_lines(c(
+    "Cox models with time-varying exposure, adjusted for race, ethnicity, sex, age, and time-varying comorbidities; robust SEs clustered by patient.",
+    "Reference: 0% above/below range (TAR, TBR) or 100% in range (TIR, where categories show increasing time out of range). Events = events in that category.",
+    "Methods A, B, C: TSH range definitions (A: 0.4-4.5, B: 0.1-10, C: 0.4-6 mIU/L).")) %>%
+  autofit()
+ft
+
+save_as_docx(ft, path = file.path(results, "cox_categorical_exposures.docx"),
+             pr_section = prop_section(page_size = page_size(orient = "landscape")))
+```
+
+# Sensitivity analysis, adjusted continuous - TIR method 2
+```{r cox regressions}
+exposures <- paste0(rep(c("TIR", "TAR", "TBR"), each = 3), "_", c("A", "B", "C"), "_10_v2")
+covs_tv   <- paste0(comorb_vars, "_tv")
+
+run_cox <- function(x, data) {
+  fit <- coxph(reformulate(c(x, "race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_keep),
+                           response = "Surv(tstart, tstop, event_tv)"),
+               data = data, cluster = cap_id)
+  tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
+    filter(term == x) %>%
+    transmute(exposure = x, estimate, conf.low, conf.high, p.value)
+}
+
+# tv must contain the comorbidity (_tv) and medication (rx_keep) columns: use tv_c / tv_rx joined data
+res <- map_dfr(exposures, run_cox, data = tv) %>%
+  mutate(
+    Measure = c(TIR = "Time in range", TAR = "Time above range",
+                TBR = "Time below range")[substr(exposure, 1, 3)],
+    Method  = paste("Method", substr(exposure, 5, 5)),
+    HR      = sprintf("%.2f (%.2f-%.2f)", estimate, conf.low, conf.high),
+    p       = ifelse(p.value < 0.001, "<0.001", sprintf("%.3f", p.value)),
+    sig     = p.value < 0.05
+  )
+
+wide <- res %>%
+  select(Method, Measure, HR, p) %>%
+  pivot_wider(names_from = Measure, values_from = c(HR, p), names_glue = "{Measure}_{.value}") %>%
+  select(Method,
+         `Time in range_HR`, `Time in range_p`,
+         `Time above range_HR`, `Time above range_p`,
+         `Time below range_HR`, `Time below range_p`)
+
+ft <- flextable(wide) %>%
+  set_header_labels(Method = "Method",
+                    `Time in range_HR` = "HR (95% CI)", `Time in range_p` = "p",
+                    `Time above range_HR` = "HR (95% CI)", `Time above range_p` = "p",
+                    `Time below range_HR` = "HR (95% CI)", `Time below range_p` = "p") %>%
+  add_header_row(values = c("", "Time in range", "Time above range", "Time below range"),
+                 colwidths = c(1, 2, 2, 2)) %>%
+  set_caption("Association of time in range with cardiovascular events (adjusted)") %>%
+  bold(part = "header") %>%
+  align(part = "header", align = "center") %>%
+  align(j = 2:7, align = "center", part = "body") %>%
+  fontsize(size = 10, part = "all") %>%
+  padding(padding.top = 3, padding.bottom = 3, part = "all") %>%
+  border_remove() %>%
+  hline_top(part = "header", border = fp_border(width = 1.5)) %>%
+  hline_bottom(part = "header", border = fp_border(width = 1)) %>%
+  hline_bottom(part = "body", border = fp_border(width = 1.5)) %>%
+  add_footer_lines(c(
+    "Cox proportional hazards models with time-varying exposure; each cell is a separate model.",
+    "Adjusted for race, ethnicity, sex, age at encounter, time-varying comorbidities, and medication exposures. HR per 10 percentage-point increase; robust SEs clustered by patient. Bold = p < 0.05.",
+    "Methods A, B, and C are the three TSH range definitions (A: 0.4-4.5, B: 0.1-10, C: 0.4-6 mIU/L).")) %>%
+  autofit()
+
+sig <- res %>% filter(sig)
+for (i in seq_len(nrow(sig))) {
+  r <- which(wide$Method == sig$Method[i])
+  ft <- bold(ft, i = r, j = paste0(sig$Measure[i], c("_HR", "_p")), part = "body")
+}
+ft
+
+save_as_docx(ft, path = file.path(results, "cox_tir_tar_tbr_adjusted_tir_v2.docx"))
+
+```
