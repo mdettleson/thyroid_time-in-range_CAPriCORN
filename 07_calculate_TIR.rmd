@@ -1,0 +1,160 @@
+---
+title: "07 TIR Calculation"
+output: html_document
+date: "2026-10-19"
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+
+data_path <- "Y:/staff/rbaccile/Matt/output/"
+
+cohort <- readRDS(file.path(data_path, "cohort_outcomes.Rds"))
+for_tir_calc <- readRDS(
+  file.path(data_path, "for_tir_calc.Rds"))
+
+
+```
+
+# Create 30 day blocks between first and last TSH
+```{r}
+cohort <- cohort %>%
+    ungroup %>%
+  mutate(
+    # Calculate censoring date — minimum of 1 year after last TSH or last encounter
+    censor_date = end_obs_date,
+    
+    # Time variable:
+    # If event occurred — use time_to_first_cv
+    # If censored — use days from last_tsh_lab to censor_date
+    surv_time = case_when(
+      cv_event == 1 ~ time_to_first_cv,
+      cv_event == 0 ~ as.numeric(as.Date(censor_date) - as.Date(first_tsh_lab)),
+      TRUE          ~ NA_real_
+    )
+  )
+
+lab_blocks <- for_tir_calc %>%
+  ungroup() %>%
+  inner_join(cohort %>% ungroup() %>% distinct(episode_id, .keep_all = TRUE) %>%
+               select(episode_id, first_tsh_lab, surv_time),
+             by = "episode_id") %>%
+  mutate(day = as.numeric(tsh_date - first_tsh_lab)) %>%
+  filter(!is.na(tsh_value), tsh_value > 0, day >= 0, day <= surv_time) %>%
+  mutate(block = floor(day / 30) + 1, log_tsh = log(tsh_value)) %>%
+  group_by(episode_id, block) %>%                       # several labs in one block: average them
+  summarise(tsh_value = mean(tsh_value), log_tsh = mean(log_tsh),
+            n_labs_block = n(), surv_time = first(surv_time), .groups = "drop") %>%
+  arrange(episode_id, block)
+
+segments <- lab_blocks %>%
+  group_by(episode_id) %>%
+  mutate(
+    next_block = lead(block),
+    next_log   = lead(log_tsh),
+    slope      = (next_log - log_tsh) / (next_block - block),   # change in log TSH per block
+    intercept  = log_tsh - slope * block,                       # so value = intercept + slope * block
+    last_block = ceiling(surv_time / 30),
+    # after the last lab: hold flat out to the end of follow-up (slope = 0)
+    slope      = if_else(is.na(next_block), 0, slope),
+    intercept  = if_else(is.na(next_block), log_tsh, intercept),
+    n_fill     = if_else(is.na(next_block), last_block - block + 1, next_block - block)
+  ) %>%
+  ungroup() %>%
+  filter(n_fill > 0)
+```
+
+
+# Slope and intercept between each lab and the NEXT lab, flag if in range
+```{r}
+blocks <- segments %>%
+  uncount(n_fill, .id = "k") %>%                     # k = 1 is the lab block itself
+  mutate(block_out = block + k - 1,
+         log_tsh_imputed = intercept + slope * block_out,
+         is_lab = (k == 1)) %>%
+  transmute(episode_id, block = block_out, tsh_value = if_else(is_lab, tsh_value, NA_real_),
+            n_labs_block = if_else(is_lab, n_labs_block, NA_integer_),
+            log_tsh = if_else(is_lab, log_tsh, NA_real_),
+            slope, intercept, log_tsh_imputed,
+            blocks_since_lab = k - 1) %>%
+  mutate(period = ceiling(block / 12))
+
+lo_A <- log(0.4); hi_A <- log(4.5)
+lo_B <- log(0.1); hi_B <- log(10)
+lo_C <- log(0.4); hi_C <- log(6)
+
+
+blocks <- blocks %>%
+  mutate(TAR_A = as.integer(log_tsh_imputed > hi_A),
+         TBR_A = as.integer(log_tsh_imputed < lo_A),
+         TIR_A = 1L - TAR_A - TBR_A,
+         TAR_B = as.integer(log_tsh_imputed > hi_B),
+         TBR_B = as.integer(log_tsh_imputed < lo_B),
+         TIR_B = 1L - TAR_B - TBR_B,
+         TAR_C = as.integer(log_tsh_imputed > hi_C),
+         TBR_C = as.integer(log_tsh_imputed < lo_C),
+         TIR_C = 1L - TAR_C - TBR_C)
+
+saveRDS(blocks, file.path(data_path, "tir_interpolated_blocks.Rds"))
+
+```
+
+# Early rise to next value alternative TIR calculation
+```{r}
+segments_v2 <- lab_blocks %>%
+  group_by(episode_id) %>%
+  mutate(
+    next_block = lead(block),
+    next_log   = lead(log_tsh),
+    last_block = ceiling(surv_time / 30),
+    n_fill     = if_else(is.na(next_block), last_block - block + 1, next_block - block)
+  ) %>%
+  ungroup() %>%
+  filter(n_fill > 0)
+
+blocks_v2 <- segments_v2 %>%
+  uncount(n_fill, .id = "k") %>%                    # k = 1 is the lab block itself
+  mutate(
+    block_out = block + k - 1,
+    is_lab    = (k == 1),
+    fill_type_v2 = case_when(
+      k == 1            ~ "lab",
+      is.na(next_block) ~ "carried_forward",        # after the last lab
+      k == 2            ~ "interpolated",           # the one block between
+      TRUE              ~ "next_value"              # takes the next lab's value
+    ),
+    log_tsh_imputed_v2 = case_when(
+      k == 1            ~ log_tsh,
+      is.na(next_block) ~ log_tsh,
+      k == 2            ~ (log_tsh + next_log) / 2,
+      TRUE              ~ next_log
+    )
+  ) %>%
+  transmute(episode_id, block = block_out,
+            tsh_value_v2    = if_else(is_lab, tsh_value, NA_real_),
+            n_labs_block_v2 = if_else(is_lab, n_labs_block, NA_integer_),
+            log_tsh_v2     = if_else(is_lab, log_tsh, NA_real_),
+            log_tsh_imputed_v2, fill_type_v2,
+            blocks_since_lab_v2 = k - 1) %>%
+  mutate(period = ceiling(block / 12))
+
+lo_A <- log(0.4); hi_A <- log(4.5)
+lo_B <- log(0.1); hi_B <- log(10)
+lo_C <- log(0.4); hi_C <- log(6)
+
+
+blocks_v2 <- blocks_v2 %>%
+  mutate(TAR_A_v2 = as.integer(log_tsh_imputed_v2 > hi_A),
+         TBR_A_v2 = as.integer(log_tsh_imputed_v2 < lo_A),
+         TIR_A_v2 = 1L - TAR_A_v2 - TBR_A_v2,
+         TAR_B_v2 = as.integer(log_tsh_imputed_v2 > hi_B),
+         TBR_B_v2 = as.integer(log_tsh_imputed_v2 < lo_B),
+         TIR_B_v2 = 1L - TAR_B_v2 - TBR_B_v2,
+         TAR_C_v2 = as.integer(log_tsh_imputed_v2 > hi_C),
+         TBR_C_v2 = as.integer(log_tsh_imputed_v2 < lo_C),
+         TIR_C_v2 = 1L - TAR_C_v2 - TBR_C_v2)
+
+saveRDS(blocks_v2, file.path(data_path, "tir_interpolated_blocks_v2.Rds"))
+
+```
