@@ -21,12 +21,13 @@ tir_interpolated_blocks <- readRDS("Y:/staff/rbaccile/Matt/output/tir_interpolat
 tir_interpolated_blocks_v2 <- readRDS("Y:/staff/rbaccile/Matt/output/tir_interpolated_blocks_v2.rds")
 
 cohort <- readRDS("Y:/staff/rbaccile/Matt/output/cohort_outcomes.Rds")
-med_flags <- readRDS("Y:/staff/rbaccile/Matt/output/med_flags.Rds")
+med_flags <- readRDS("Y:/staff/rbaccile/Matt/output/meds_base.Rds")
+med_days <- readRDS("Y:/staff/rbaccile/Matt/output/meds_days.Rds")
+med_tv_vars <- sub("^day_", "", grep("^day_", names(comorb_days), value = TRUE))
+rx_base_vars <- grep("^rx_.*_base$", names(tv_rx), value = TRUE)
+
 rxcui <- read.csv('U:/CAPriCORN_raw_ds/CAPriCORN/med_covariate_rxnorm.csv')
 
-# All medication flag columns
-rx_vars <- grep("^rx_", names(med_flags), value = TRUE)
-rx_vars
 
 # Drop flags that are constant (all 0 or all 1) or too rare to estimate
 prev <- colMeans(med_flags[, rx_vars], na.rm = TRUE)
@@ -41,6 +42,8 @@ comorb_vars <- sub("^dxday_", "", grep("^dxday_", names(comorb_days), value = TR
 comorb_base <- readRDS("Y:/staff/rbaccile/Matt/output/comorb_base.Rds")
 base_vars <- grep("_base$", names(comorb_base), value = TRUE)
 
+weight_base <- readRDS("Y:/staff/rbaccile/Matt/output/weight_base.Rds")
+
 ```
 
 
@@ -48,7 +51,6 @@ base_vars <- grep("_base$", names(comorb_base), value = TRUE)
 ## Create time-varying exposure dataframe
 cohort <- cohort %>%
     ungroup %>%
-  left_join(med_flags) %>%
   left_join(comorb_base) %>%
   filter(rx_antithyroid_exclusion!=1) %>%
   mutate(# Calculate censoring date — minimum of 1 year after last TSH or last encounter
@@ -186,6 +188,33 @@ tv <- tv %>%
                 .names = "{sub('dxday_', '', .col)}_tv")) %>%
   select(-starts_with("dxday_"))
 
+## Add Meds
+day_cols <- setdiff(grep("^day_", names(med_days), value = TRUE), "day_rx_antithyroid_exclusion")
+rx_stem  <- sub("^day_", "", day_cols)
+rx_tv_vars   <- paste0(rx_stem, "_tv")
+rx_base_vars <- paste0(rx_stem, "_base")
+
+tv <- tv %>%
+  left_join(med_days %>% select(episode_id, all_of(day_cols)), by = "episode_id") %>%
+  mutate(
+    # time-varying: first prescription on or before the interval start
+    across(all_of(day_cols), ~ as.integer(!is.na(.x) & .x <= tstart),
+           .names = "{sub('^day_', '', .col)}_tv"),
+    # baseline: first prescription on or before time zero, fixed over follow-up
+    across(all_of(day_cols), ~ as.integer(!is.na(.x) & .x <= 0),
+           .names = "{sub('^day_', '', .col)}_base")
+  ) %>%
+  select(-all_of(day_cols))
+
+n_pos_base <- tv %>%
+  distinct(episode_id, .keep_all = TRUE) %>%
+  select(all_of(rx_base_vars)) %>%
+  colSums()
+
+rx_keep_base <- rx_base_vars[n_pos_base >= 50]     # adjust the minimum as needed
+rx_keep_base
+
+saveRDS(tv, file.path(output_folder, "time_varying_analytic_df.Rds"))
 ```
 
 # Summary table
@@ -229,10 +258,16 @@ names(base_use) <- comorb_lab[sub("_base$", "", base_use)]      # nice names
 base_use <- base_use[!is.na(names(base_use))]
 
 # medication nice names come from the category names themselves
-rx_lab  <- setNames(unique(rxcui$medication_category),
-                    paste0("rx_", make_clean_names(unique(rxcui$medication_category))))
-rx_use  <- intersect(rx_keep, names(rx_lab))
-names(rx_use) <- rx_lab[rx_use]; rx_use <- setNames(rx_use, names(rx_use))
+base_flags <- med_days %>%
+  transmute(episode_id,
+            across(all_of(day_cols), ~ as.integer(!is.na(.x) & .x <= 0),
+                   .names = "{sub('^day_', '', .col)}_base"))
+
+rx_base_vars <- setdiff(names(base_flags), "episode_id")
+rx_keep_base <- rx_base_vars[colSums(base_flags[, rx_base_vars]) >= 50]
+cohort <- cohort %>%
+  left_join(base_flags, by = "episode_id") %>%
+  mutate(across(all_of(rx_base_vars), ~ coalesce(.x, 0L)))
 
 tir  <- c("TIR_A","TAR_A","TBR_A","TIR_B","TAR_B","TBR_B","TIR_C","TAR_C","TBR_C")
 mk_tir <- function(suffix = "") {
@@ -262,9 +297,9 @@ all_v <- unlist(groups, use.names = FALSE)
 d <- cohort %>% ungroup() %>%
   mutate(across(all_of(c(tir, paste0(tir, "_v2"))), ~ .x * 100))        # proportions -> %
 
-cat_v  <- intersect(c(categorical_vars, base_use, rx_use, "afib","stroke","mi","hf",
-                      "race_cat","hispanic","sex"), all_v)
-nonnorm <- setdiff(all_v, cat_v)
+cont_v <- c("n_blocks", "n_labs", "surv_time", "age_enc", tir, paste0(tir, "_v2"))
+cat_v   <- setdiff(all_v, cont_v)
+nonnorm <- intersect(cont_v, all_v)
 
 t2 <- CreateTableOne(vars = all_v, strata = "cv_event", data = d,
                      factorVars = cat_v, addOverall = TRUE)
@@ -420,7 +455,7 @@ covs_tv   <- paste0(comorb_vars, "_tv")
 
 # 1. Fit models, keeping ALL terms
 run_cox_all <- function(x, data) {
-  fit <- coxph(reformulate(c(x, "race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_keep),
+  fit <- coxph(reformulate(c(x, "race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_tv_vars),
                            response = "Surv(tstart, tstop, event_tv)"),
                data = data, cluster = cap_id)
   tidy(fit, exponentiate = TRUE, conf.int = TRUE) %>%
@@ -526,7 +561,7 @@ cox_base <- coxph(f_base, data = tv_b, cluster = cap_id)
 # Compare the exposure estimate across the three specifications
 cox_none <- coxph(Surv(tstart, tstop, event_tv) ~ TAR_A_10 + race_cat + hispanic + sex + age_enc,
                   data = tv_b, cluster = cap_id)
-cox_tv  <- coxph(reformulate(c("TAR_A_10", "race_cat", "hispanic", "sex", "age_enc", covs_tv),
+cox_tv  <- coxph(reformulate(c("TAR_A_10", "race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_keep),
                               response = "Surv(tstart, tstop, event_tv)"),
                   data = tv, cluster = cap_id)   
 
@@ -571,7 +606,7 @@ run_cox_cat <- function(x, data) {
   d <- data
   d$exp_cat <- make_cat(d[[x]], substr(x, 1, 3))
 
-  covs <- c("race_cat", "hispanic", "sex", "age_enc", covs_tv)
+  covs <- c("race_cat", "hispanic", "sex", "age_enc", covs_tv, rx_keep)
   f <- reformulate(c("exp_cat", covs), response = "Surv(tstart, tstop, event_tv)")
   fit <- coxph(f, data = d, cluster = cap_id)
 
@@ -690,7 +725,6 @@ run_cox <- function(x, data) {
     transmute(exposure = x, estimate, conf.low, conf.high, p.value)
 }
 
-# tv must contain the comorbidity (_tv) and medication (rx_keep) columns: use tv_c / tv_rx joined data
 res <- map_dfr(exposures, run_cox, data = tv) %>%
   mutate(
     Measure = c(TIR = "Time in range", TAR = "Time above range",
