@@ -1,0 +1,398 @@
+---
+title: "06 Comorbidities"
+author: "Rachel Baccile"
+---
+
+```{r, include=FALSE}
+packages <- c("duckdb", "lubridate", "tidyverse", "dplyr", "readr", "arrow", "fst", "DBI", "janitor")
+
+install_if_missing <- function(package) {
+  if (!require(package, character.only = TRUE)) {
+    install.packages(package, dependencies = TRUE)
+    library(package, character.only = TRUE)
+  }
+}
+
+sapply(packages, install_if_missing)
+
+read_data <- function(file_path) {
+  if (grepl("\\.csv$", file_path)) {
+    return(read.csv(file_path))
+  } else if (grepl("\\.parquet$", file_path)) {
+    return(arrow::read_parquet(file_path))
+  } else if (grepl("\\.fst$", file_path)) {
+    return(fst::read.fst(file_path))
+  } else {
+    stop("Unsupported file format")
+  }
+}
+
+
+write_files_to_duckdb <- function(files, tables_location, file_type, con) {
+  for (file_name in names(files)) {
+    file_path <- file.path(tables_location, 
+                           paste0(file_name, ".", file_type))
+    
+    # Verify file exists before trying to read
+    if (!file.exists(file_path)) {
+      stop(paste("File not found:", file_path))
+    }
+    
+    data <- as.data.frame(read_data(file_path))
+    table_name <- files[[file_name]]
+    duckdb::dbWriteTable(con, table_name, data)
+    print(paste("Wrote table:", table_name, "from:", file_path))
+    rm(data)
+  }
+}
+
+normalize_id <- function(x) {
+  x <- as.character(x)
+  
+  x <- iconv(
+    x,
+    from = "",
+    to = "UTF-8",
+    sub = ""
+  )
+  
+  x <- stringr::str_trim(x)
+  x[x == ""] <- NA_character_
+  
+  x
+}
+
+normalize_rxcui <- function(x) {
+  x %>%
+    normalize_id() %>%
+    str_replace("\\.0+$", "")
+}
+
+parse_mixed_date <- function(x) {
+  parsed_date <- suppressWarnings(
+    parse_date_time(
+      as.character(x),
+      orders = c(
+        "ymd HMS",
+        "ymd HM",
+        "ymd",
+        "mdy HMS",
+        "mdy HM",
+        "mdy",
+        "dmy HMS",
+        "dmy HM",
+        "dmy"
+      ),
+      tz = "UTC",
+      quiet = TRUE
+    )
+  )
+  
+  as.Date(parsed_date)
+}
+
+con <- duckdb::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+tables_location <- '//cri-rss.cri.uchicago.edu/ettleson-lab/CAPriCORN_raw_ds/parquet'
+output_folder <- '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/'
+file_type <- 'parquet'
+
+capricorn_dir <- "//cri-rss.cri.uchicago.edu/ettleson-lab/CAPriCORN_raw_ds/CAPriCORN"  # Read Data
+
+prescribing_path <- file.path(
+  capricorn_dir,
+  "Prescribing.csv"
+)
+
+rxcui_path <- file.path(
+  capricorn_dir,
+  "med_covariate_rxnorm.csv"
+)
+
+```
+
+# Read data
+```{r }
+icd10_snomed_crosswalk <- read.csv(paste0(tables_location, "/icd10_snomed_crosswalk.csv"))
+rxcui <- read.csv('U:/CAPriCORN_raw_ds/CAPriCORN/med_covariate_rxnorm.csv')
+
+files <- list(
+  "condition" = "condition",
+  "diagnosis" = "diagnosis",
+  "vital" = "vital"
+)
+
+write_files_to_duckdb(files, tables_location, file_type, con)
+
+```
+
+# Codes per condition: ICD-10 + SNOMED, de-duplicated, NAs removed
+```{r}
+get_codes <- function(cond, xwalk = icd10_snomed_crosswalk) {
+  d <- xwalk %>% filter(condition == cond)
+  codes <- c(d$icd10_target, d$snomed_concept_id)
+  codes <- unique(as.character(codes))
+  codes[!is.na(codes) & codes != ""]
+}
+
+conditions <- sort(unique(icd10_snomed_crosswalk$condition))
+codes_list <- set_names(map(conditions, get_codes), conditions)
+
+to_sql <- function(x) paste0("'", str_replace_all(x, "'", "''"), "'", collapse = ", ")
+sql_list <- map(codes_list, to_sql)
+
+short_names <- c(
+  "Anemia" = "anemia",
+  "Cardiovascular disease (baseline)" = "cvd",
+  "CKD" = "ckd",
+  "Dementia" = "dementia",
+  "Diabetes mellitus type 1" = "dm1",
+  "Diabetes mellitus type 2" = "dm2",
+  "GI disease - IBD and intestinal malabsorption" = "ibd",
+  "GI disease - peptic ulcer disease" = "pud",
+  "Hyperlipidemia" = "hld",
+  "Hypertension" = "htn",
+  "Liver disease" = "liver",
+  "Malignancy" = "malignancy",
+  "MDD/Anxiety" = "mdd_anx",
+  "Obesity" = "obesity",
+  "Osteoarthritis" = "oa",
+  "Osteoporosis" = "osteoporosis",
+  "Pregnancy (active - censoring event)" = "pregnancy",
+  "Pulmonary disease" = "pulm",
+  "Rheumatoid arthritis and other CTD" = "ra_ctd",
+  "Sleep disorders" = "sleep"
+)
+codes_short <- set_names(codes_list, short_names[names(codes_list)])
+codes_long <- imap_dfr(codes_short, ~ tibble(condition_group = .y, code = .x)) %>%
+  filter(condition_group != "pregnancy") %>%
+  distinct()
+sql_short   <- set_names(sql_list,   short_names[names(sql_list)])
+if (dbExistsTable(con, "code_map")) dbRemoveTable(con, "code_map")
+dbWriteTable(con, "code_map", codes_long, temporary = TRUE)
+```
+
+#import conditions, filter to eligible population
+```{r data read and review}
+cohort <- readRDS(paste0(output_folder, "cohort_outcomes.Rds"))
+duckdb::duckdb_register(con, "cohort", cohort)
+
+query_cond <- "
+SELECT
+    c.STUDY_ID,
+    c.REPORT_DATE,
+    c.ONSET_DATE,
+    c.CONDITION,
+    c.CONDITION_TYPE,
+    m.condition_group AS diagnosis_group
+FROM condition c
+INNER JOIN code_map m
+    ON c.CONDITION = m.code
+WHERE c.STUDY_ID IN (SELECT STUDY_ID FROM cohort)
+"
+
+query_dx <- "
+SELECT
+    c.STUDY_ID,
+    c.DX_DATE,
+    c.DX,
+    c.DX_TYPE,
+    m.condition_group AS diagnosis_group
+FROM diagnosis c
+INNER JOIN code_map m
+    ON c.DX = m.code
+WHERE c.STUDY_ID IN (SELECT STUDY_ID FROM cohort)
+"
+
+condition <- dbGetQuery(con, query_cond)
+dx <- dbGetQuery(con, query_dx)
+
+```
+
+# get first diagnosis date per condition
+
+```{r}
+dx_first <- dx %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(DX_DATE) %>% distinct()
+
+condition$REPORT_DATE <- as.Date(
+  parse_date_time(condition$REPORT_DATE, orders = c("ymd", "mdy"))
+)
+condition$ONSET_DATE <- as.Date(condition$ONSET_DATE)
+condition$min_cond_date <- pmin(condition$ONSET_DATE, condition$REPORT_DATE, na.rm = TRUE)
+condition_first <- condition %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(min_cond_date) %>% distinct()
+
+dx_cond <- full_join(condition_first, dx_first)
+dx_cond$first_dx_date <- pmin(dx_cond$min_cond_date, dx_cond$DX_DATE, na.rm = TRUE)
+dx_cond$icd_code <- ifelse(is.na(dx_cond$DX), dx_cond$CONDITION, dx_cond$DX)
+dx_cond <- dx_cond %>% select(STUDY_ID, diagnosis_group, first_dx_date) %>% distinct() %>% group_by(STUDY_ID, diagnosis_group) %>% slice_min(first_dx_date) %>% distinct()
+dx_cond$STUDY_ID <- as.character(dx_cond$STUDY_ID)
+
+cohort_dx <- left_join(cohort, dx_cond, by=c("cap_id" = "STUDY_ID") )
+cohort_dx <- cohort_dx %>% select(cap_id, first_dx_date, first_tsh_lab, diagnosis_group) %>% distinct()
+
+comorb_days <- cohort_dx %>%
+  mutate(dx_day = as.numeric(as.Date(first_dx_date) - as.Date(first_tsh_lab))) %>%
+  group_by(cap_id, diagnosis_group) %>%
+  summarise(dx_day = min(dx_day), .groups = "drop") %>%      # earliest, in case of duplicates
+  pivot_wider(names_from = diagnosis_group, values_from = dx_day,
+              names_prefix = "dxday_")
+
+saveRDS(comorb_days, "//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/comorb_days.Rds")
+
+comorb_base <- cohort_dx %>%
+  mutate(dx_day = as.numeric(as.Date(first_dx_date) - as.Date(first_tsh_lab))) %>%
+  group_by(cap_id, diagnosis_group) %>%
+  summarise(baseline = as.integer(min(dx_day) <= 0), .groups = "drop") %>%
+  pivot_wider(names_from = diagnosis_group, values_from = baseline,
+              names_glue = "{diagnosis_group}_base", values_fill = 0)
+
+saveRDS(comorb_base , "//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/comorb_base.Rds")
+```
+
+# Medication covariates
+```{r}
+win <- cohort %>% ungroup() %>%
+  mutate(
+        # Calculate censoring date — minimum of 1 year after last TSH or last encounter
+        censor_date = end_obs_date) %>%
+  distinct(cap_id, episode_id, first_tsh_lab, censor_date) %>%
+  transmute(cap_id, episode_id, win_start = as.Date(first_tsh_lab),
+            win_end   = as.Date(censor_date))
+
+rxcui_raw <- read_csv(rxcui_path) %>%
+  clean_names()
+rxcui_raw$rxnorm_cui <- as.character(rxcui_raw$rxnorm_cui)
+
+rxcui <- rxcui_raw %>%
+  select(rxnorm_cui) %>%
+  unlist(use.names = FALSE) %>%
+  normalize_rxcui() %>%
+  discard(is.na) %>%
+  unique()
+
+prescribing <- read_csv(
+  prescribing_path,
+  col_select = c(
+    STUDY_ID,
+    RXNORM_CUI,
+    RAW_RX_NDC,
+    RAW_RX_MED_NAME,
+    RX_ORDER_DATE,
+    RX_DOSE_ORDRED,
+    RX_DOSE_ORDRED_UNIT),
+  col_types = cols(.default = col_character()),
+  show_col_types = FALSE) %>%
+  transmute(
+    cap_id = normalize_id(STUDY_ID),
+    rxnorm_cui = normalize_rxcui(RXNORM_CUI),
+    rx_date = parse_mixed_date(RX_ORDER_DATE),
+    rx_dose = normalize_id(RX_DOSE_ORDRED),
+    rx_dose_unit = normalize_id(RX_DOSE_ORDRED_UNIT),
+    record_source = "prescribing") %>%
+  semi_join(
+    cohort,
+    by = "cap_id") %>%
+  mutate(
+    matched_rxcui = (
+      !is.na(rxnorm_cui) &
+        rxnorm_cui %in% rxcui)) %>%
+  filter(matched_rxcui)
+
+prescribing <- left_join(prescribing, rxcui_raw)
+
+
+cat_lookup <- tibble(medication_category = sort(unique(prescribing$medication_category))) %>%
+  filter(!is.na(medication_category)) %>%
+  mutate(var = paste0("rx_", make_clean_names(medication_category)))   # runs on ~20 unique values
+
+rx_hits <- prescribing %>%
+  select(cap_id, rxnorm_cui, rx_date, medication_category) %>%
+  filter(!is.na(rx_date), !is.na(medication_category)) %>%
+  inner_join(win, by = "cap_id") %>%
+  filter(rx_date <= win_end) %>%
+  mutate(rx_day = as.numeric(rx_date - win_start)) %>%
+  group_by(episode_id, medication_category) %>%
+  summarise(first_rx_day = min(rx_day), n_rx = n(), .groups = "drop") %>%
+  left_join(cat_lookup, by = "medication_category")
+
+# Wide table of first-prescription days, one row per episode
+rx_days <- rx_hits %>%
+  select(episode_id, var, first_rx_day) %>%
+  pivot_wider(names_from = var, values_from = first_rx_day, names_prefix = "day_")
+saveRDS(rx_days, '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/meds_days.Rds')
+
+# make sure every category has a column, even with no hits
+all_vars <- paste0("rx_", make_clean_names(sort(unique(prescribing$medication_category))))
+for (v in setdiff(paste0("day_", all_vars), names(rx_days))) rx_days[[v]] <- NA_real_
+
+
+# Wide 0/1 flags, one row per patient (including patients with none)
+flags <- rx_hits %>%
+  mutate(flag = 1L) %>%
+  select(episode_id, medication_category, flag) %>%
+  pivot_wider(names_from = medication_category, values_from = flag,
+              names_prefix = "rx_", values_fill = 0L) %>%
+  clean_names()
+rx_vars <- grep("^rx_", names(flags), value = TRUE)
+
+# Add every patient, and every category even if it had no hits
+all_cats <- paste0("rx_", make_clean_names(unique(map$medication_category)))
+
+flags_all <- win %>% distinct(episode_id) %>%
+  left_join(flags, by = "episode_id" )
+
+flags_all <- flags_all %>%
+  mutate(across(all_of(rx_vars), ~ coalesce(as.integer(.x), 0L)))
+
+saveRDS(flags_all, '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/meds_base.Rds')
+
+```
+
+# Weight covariate
+```{r}
+query_vit <- "
+SELECT
+    c.STUDY_ID,
+    c.MEASURE_DATE,
+    c.WT,
+    c.ORIGINAL_BMI,
+FROM vital c
+WHERE c.STUDY_ID IN (SELECT STUDY_ID FROM cohort)
+"
+
+vitals <- dbGetQuery(con, query_vit)
+
+vitals <-  vitals %>%
+  transmute(cap_id = as.character(STUDY_ID), vital_date = MEASURE_DATE,
+              weight = as.numeric(WT), bmi = as.numeric(ORIGINAL_BMI)) %>%
+  inner_join(win, by = "cap_id") %>%
+  filter(vital_date <= win_end) 
+
+vitals$time_wt_start <- as.numeric(vitals$win_start - vitals$vital_date)
+
+first_weight <- vitals %>% 
+  group_by(episode_id) %>% 
+  filter(!is.na(weight)) %>% 
+  slice_min(abs(time_wt_start)) %>% 
+  select(episode_id, win_start, weight, vital_date, time_wt_start) %>% distinct() %>%
+  filter(abs(time_wt_start) < 90) %>%
+  group_by(episode_id) %>%
+  summarise(baseline_weight = max(weight)) %>% ungroup()
+
+saveRDS(first_weight, '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/weight_base.Rds')
+
+vitals <- vitals %>% 
+  filter(vital_date >= win_start&
+           !is.na(weight)) %>% 
+  group_by(episode_id, vital_date) %>%
+  summarise(weight = max(weight)) %>%
+  transmute(episode_id, weight_date = vital_date, weight) %>% ungroup()
+
+wt_days <- vitals %>%
+  inner_join(cohort %>% ungroup() %>% distinct(episode_id, first_tsh_lab), by = "episode_id") %>%
+  mutate(wt_day = as.numeric(as.Date(weight_date) - as.Date(first_tsh_lab))) %>%
+  filter(!is.na(weight), weight > 0, !is.na(wt_day)) %>%
+  group_by(episode_id, wt_day) %>%
+  summarise(weight = mean(weight), .groups = "drop")        # one value per day
+saveRDS(wt_days, '//cri-rss.cri.uchicago.edu/chess-lab/staff/rbaccile/Matt/output/weight_tv.Rds')
+
+```
